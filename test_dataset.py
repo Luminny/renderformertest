@@ -10,44 +10,6 @@ import numpy as np
 import torch
 from pathlib import Path
 
-# def create_test_h5_file(file_path):
-#     """Create a simple test H5 file"""
-#     # Create small test data
-#     num_triangles = 2048
-#     num_views = 2
-#     texture_channels = 13
-#     patch_size = 32
-    
-#     # Generate random test data
-#     triangles = np.random.randn(num_triangles, 3, 3).astype(np.float32)
-#     texture = np.random.randn(num_triangles, texture_channels, patch_size, patch_size).astype(np.float32)
-#     vn = np.random.randn(num_triangles, 3, 3).astype(np.float32)
-#     c2w = np.random.randn(num_views, 4, 4).astype(np.float32)
-#     fov = np.random.randn(num_views).astype(np.float32) * 30 + 45  # 15-75 degrees
-#     gt_images = np.random.randn(num_views, 256, 256, 3).astype(np.float32)
-    
-#     # Make c2w valid transformation matrices
-#     for i in range(num_views):
-#         c2w[i, :3, :3] = np.eye(3)  # Identity rotation
-#         c2w[i, 3, 3] = 1.0  # Homogeneous coordinate
-    
-#     # Save to H5 file
-#     with h5py.File(file_path, 'w') as f:
-#         f.create_dataset('triangles', data=triangles)
-#         f.create_dataset('texture', data=texture)
-#         f.create_dataset('vn', data=vn)
-#         f.create_dataset('c2w', data=c2w)
-#         f.create_dataset('fov', data=fov)
-#         f.create_dataset('gt_images', data=gt_images)
-    
-#     print(f"Created test H5 file: {file_path}")
-#     return {
-#         'num_triangles': num_triangles,
-#         'num_views': num_views,
-#         'texture_shape': texture.shape,
-#         'gt_shape': gt_images.shape
-#     }
-
 def test_dataset():
     """Test RenderFormerDataset"""
     print("Testing RenderFormerDataset...")
@@ -62,7 +24,7 @@ def test_dataset():
     
     # Create temporary directory for test files
     # with tempfile.TemporaryDirectory() as temp_dir:
-    temp_dir = "./tmp/data" 
+    temp_dir = "./tmp/testcube" 
     print(f"Using temporary directory: {temp_dir}")
     
     # # Create multiple test H5 files

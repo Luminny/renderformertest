@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import wandb
 from pathlib import Path
+import imageio
 
 from renderformer import RenderFormerRenderingPipeline
 
@@ -42,15 +43,12 @@ class RenderFormerDataset(Dataset):
             mask = torch.ones(num_tris, dtype=torch.bool)
             vn = torch.from_numpy(np.array(f['vn']).astype(np.float32))
             c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
-            fov = torch.from_numpy(np.array(f['fov']).astype(np.float32))
-            
-            # Load ground truth images if available
-            if 'gt_img' in f:
-                gt_images = torch.from_numpy(
-                    np.array(f['gt_img']).astype(np.float32)
-                )
-            else:
-                gt_images = None
+            fov = torch.from_numpy(np.array(f['fov']).astype(np.float32)).unsqueeze(0)
+
+        gt_images_exr_file = str(h5_file).replace('.h5', '.exr')
+        gt_images = torch.from_numpy(
+            imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
+        ).unsqueeze(0)
 
         data = {
             'triangles': triangles,
@@ -96,8 +94,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config):
         gt_images = (data['gt_img'].to(device) 
                     if data['gt_img'] is not None else None)
         
-        # Forward pass
-        optimizer.zero_grad()
+        # # Forward pass
+        # print(f"gt_images: {gt_images.shape}")
+        # print(f"triangles: {triangles.shape}")
+        # print(f"texture: {texture.shape}")
+        # print(f"mask: {mask.shape}")
+        # print(f"vn: {vn.shape}")
+        # print(f"c2w: {c2w.shape}")
+        # print(f"fov: {fov.shape}")
         
         try:
             # Set precision dtype
@@ -124,8 +128,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config):
                 loss = compute_loss(rendered_imgs, gt_images, 
                                   config.loss_type)
             else:
-                # If no ground truth, use a simple regularization loss
-                loss = torch.mean(torch.abs(rendered_imgs))
+                print(f"gt_images is None")
+            
+            optimizer.zero_grad()
             
             # Backward pass
             loss.backward()
@@ -183,8 +188,8 @@ def validate(model, dataloader, device, config):
             vn = data['vn'].to(device)
             c2w = data['c2w'].to(device)
             fov = data['fov'].to(device)
-            gt_images = (data['gt_images'].to(device) 
-                        if data['gt_images'] is not None else None)
+            gt_images = (data['gt_img'].to(device) 
+                        if data['gt_img'] is not None else None)
             
             try:
                 # Set precision dtype
@@ -225,16 +230,52 @@ def validate(model, dataloader, device, config):
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
-    """Save model checkpoint"""
-    checkpoint = {
+    """Save model checkpoint in Hugging Face format"""
+    # 创建保存目录
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 保存模型权重
+    model.model.save_pretrained(save_path)
+    
+    # 保存训练状态（优化器、调度器等）
+    training_state = {
         'epoch': epoch,
-        'model_state_dict': model.model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'loss': loss,
     }
-    torch.save(checkpoint, save_path)
-    print(f"Checkpoint saved to {save_path}")
+    
+    # # 保存训练状态到 JSON 文件
+    # import json
+    # with open(os.path.join(save_path, 'training_state.json'), 'w') as f:
+    #     json.dump(training_state, f, indent=2)
+    
+    print(f"Model saved to {save_path} in Hugging Face format")
+
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+    """Load model checkpoint from Hugging Face format"""
+    # 加载模型权重
+    model = model.from_pretrained(checkpoint_path)
+    
+    # 加载训练状态
+    training_state_path = os.path.join(checkpoint_path, 'training_state.json')
+    if os.path.exists(training_state_path):
+        import json
+        with open(training_state_path, 'r') as f:
+            training_state = json.load(f)
+        
+        # 恢复优化器和调度器状态
+        optimizer.load_state_dict(training_state['optimizer_state_dict'])
+        scheduler.load_state_dict(training_state['scheduler_state_dict'])
+        
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"Resuming from epoch {training_state['epoch']} with loss {training_state['loss']}")
+        
+        return model, optimizer, scheduler, training_state['epoch'], training_state['loss']
+    else:
+        print(f"No training state found at {training_state_path}")
+        return model, optimizer, scheduler, 0, float('inf')
 
 
 def main():
@@ -276,6 +317,8 @@ def main():
                        help="Output directory for checkpoints")
     parser.add_argument("--save_freq", type=int, default=10, 
                        help="Save checkpoint every N epochs")
+    parser.add_argument("--resume_from", type=str, 
+                       help="Resume training from Hugging Face checkpoint directory")
     
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true", 
@@ -305,7 +348,16 @@ def main():
     
     # Load model
     print(f"Loading model from {args.model_id}")
-    pipeline = RenderFormerRenderingPipeline.from_pretrained(args.model_id)
+    pretrained_pipeline = RenderFormerRenderingPipeline.from_pretrained(args.model_id)
+    pipeline = pretrained_pipeline
+
+    # print(f"Creating new RenderFormer model from scratch...")
+    # from renderformer.models.config import RenderFormerConfig
+    # from renderformer.models.renderformer import RenderFormer
+    
+    # # config = RenderFormerConfig(norm_first=True)
+    # pipeline = RenderFormerRenderingPipeline(RenderFormer(pretrained_pipeline.config))
+    # print("✓ New model created successfully")
     
     # Apply optimizations
     if device == torch.device('cuda') and os.name == 'posix':  # avoid windows
@@ -357,11 +409,19 @@ def main():
         T_max=args.epochs,
         eta_min=args.learning_rate * 0.01
     )
+
+     # Resume from checkpoint if specified
+    start_epoch = 0
+    best_val_loss = float('inf')
+    # if args.resume_from:
+    #     pipeline, optimizer, scheduler, start_epoch, best_val_loss = load_checkpoint(
+    #         pipeline, optimizer, scheduler, args.resume_from
+    #     )
+    #     pipeline.to(device)
+    #     print(f"Resuming training from epoch {start_epoch}")
     
     # Training loop
-    best_val_loss = float('inf')
-    
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         
         # Train
@@ -387,7 +447,7 @@ def main():
                 best_val_loss = val_loss
                 save_checkpoint(
                     pipeline, optimizer, scheduler, epoch, val_loss,
-                    os.path.join(args.output_dir, "best_model.pth")
+                    os.path.join(args.output_dir, "best_model")
                 )
         else:
             if args.use_wandb:
@@ -400,13 +460,13 @@ def main():
         if (epoch + 1) % args.save_freq == 0:
             save_checkpoint(
                 pipeline, optimizer, scheduler, epoch, train_loss,
-                os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+                os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
             )
     
     # Save final model
     save_checkpoint(
         pipeline, optimizer, scheduler, args.epochs-1, train_loss,
-        os.path.join(args.output_dir, "final_model.pth")
+        os.path.join(args.output_dir, "final_model")
     )
     
     print("Training completed!")

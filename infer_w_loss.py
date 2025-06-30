@@ -8,6 +8,8 @@ import imageio
 from renderformer import RenderFormerRenderingPipeline
 from simple_ocio import ToneMapper
 
+from train import compute_loss
+
 
 def load_single_h5_data(file_path):
     with h5py.File(file_path, 'r') as f:
@@ -19,6 +21,11 @@ def load_single_h5_data(file_path):
         c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
         fov = torch.from_numpy(np.array(f['fov']).astype(np.float32))
 
+        gt_images_exr_file = str(file_path).replace('.h5', '.exr')
+        gt_images = torch.from_numpy(
+            imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
+        ).unsqueeze(0)
+
         data = {
             'triangles': triangles,
             'texture': texture,
@@ -26,6 +33,7 @@ def load_single_h5_data(file_path):
             'c2w': c2w,
             'fov': fov,
             'vn': vn,
+            'gt_img': gt_images,
         }
     return data
 
@@ -83,7 +91,9 @@ def main():
         torch_dtype=torch.float16 if args.precision == 'fp16' else torch.bfloat16 if args.precision == 'bf16' else torch.float32,
     )
     print("Inference completed. Rendered images shape:", rendered_imgs.shape)
-
+    
+    loss = compute_loss(rendered_imgs, data['gt_img'].to(device), 'l1')
+    print(f"Loss: {loss}")
 
     output_dir = args.output_dir if args.output_dir else os.path.dirname(args.h5_file)
     os.makedirs(output_dir, exist_ok=True)
