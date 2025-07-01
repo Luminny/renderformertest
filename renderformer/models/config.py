@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Literal, List, Optional
-
+import json
+from pathlib import Path
 
 @dataclass(frozen=True)
 class RenderFormerConfig:
@@ -90,3 +91,13 @@ class RenderFormerConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
+    
+    @classmethod
+    def from_json(cls, json_path):
+        """从 JSON 文件创建 RenderFormerConfig 实例"""
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"Config file not found: {json_path}")
+        with open(json_path, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)

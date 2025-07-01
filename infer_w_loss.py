@@ -8,7 +8,7 @@ import imageio
 from renderformer import RenderFormerRenderingPipeline
 from simple_ocio import ToneMapper
 
-from train import compute_loss
+from train_geo_raster import compute_loss
 
 
 def load_single_h5_data(file_path):

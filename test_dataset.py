@@ -16,7 +16,7 @@ def test_dataset():
     
     # Import the dataset class
     try:
-        from train import RenderFormerDataset
+        from train_geo_raster import RenderFormerDataset
         print("✓ Successfully imported RenderFormerDataset")
     except ImportError as e:
         print(f"✗ Failed to import RenderFormerDataset: {e}")
@@ -24,7 +24,7 @@ def test_dataset():
     
     # Create temporary directory for test files
     # with tempfile.TemporaryDirectory() as temp_dir:
-    temp_dir = "./tmp/testcube" 
+    temp_dir = "F:/projects/renderformer/traindata/000-000" 
     print(f"Using temporary directory: {temp_dir}")
     
     # # Create multiple test H5 files
@@ -59,7 +59,7 @@ def test_dataset():
             print(f"  Sample {i+1}:")
             
             # Check required keys
-            required_keys = ['triangles', 'texture', 'c2w', 'fov', 'vn', 'file_path']
+            required_keys = ['triangles', 'c2w', 'fov', 'vn', 'file_path']
             for key in required_keys:
                 if key in sample:
                     print(f"    ✓ {key}: {type(sample[key])}")
@@ -75,7 +75,6 @@ def test_dataset():
 
             # Check tensor shapes
             print(f"    triangles shape: {sample['triangles'].shape}")
-            print(f"    texture shape: {sample['texture'].shape}")
             print(f"    c2w shape: {sample['c2w'].shape}")
             print(f"    fov shape: {sample['fov'].shape}")
             print(f"    vn shape: {sample['vn'].shape}")
@@ -83,7 +82,7 @@ def test_dataset():
                 print(f"    gt_img shape: {sample['gt_img'].shape}")
 
             # Check data types
-            for key in ['triangles', 'texture', 'c2w', 'fov', 'vn']:
+            for key in ['triangles', 'c2w', 'fov', 'vn']:
                 if not isinstance(sample[key], torch.Tensor):
                     print(f"    ✗ {key} is not a torch.Tensor")
                     return False
