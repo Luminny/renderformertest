@@ -35,6 +35,13 @@ def test_train_dataset(pipeline, dataloader, device, config):
         gt_images = (data['gt_img'].to(device) 
                     if data['gt_img'] is not None else None)
         
+        print(f"triangles: {triangles.shape}")
+        print(f"mask: {mask.shape}")
+        print(f"vn: {vn.shape}")
+        print(f"c2w: {c2w.shape}")
+        print(f"fov: {fov.shape}")
+        print(f"gt_images: {gt_images.shape}")
+        
         rendered_imgs = pipeline(
             triangles=triangles,
             mask=mask,
