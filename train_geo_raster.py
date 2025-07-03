@@ -11,6 +11,7 @@ from tqdm import tqdm
 import wandb
 from pathlib import Path
 import imageio
+from datetime import datetime
 
 from renderformer import GeoRasterRenderingPipeline
 from renderformer.models.config import RenderFormerConfig
@@ -114,7 +115,7 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, config):
+def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_file=None):
     """Train for one epoch"""
     model.model.train()
     total_loss = 0.0
@@ -172,6 +173,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config):
             
             total_loss += loss.item()
             num_batches += 1
+            
+            # Log batch loss to file
+            if log_file:
+                with open(log_file, 'a') as f:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"[{timestamp}] Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {scheduler.get_last_lr()[0]:.2e}\n")
             
             # Update progress bar
             progress_bar.set_postfix({
@@ -262,8 +269,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
     # 创建保存目录
     os.makedirs(save_path, exist_ok=True)
     
-    # 保存模型权重
-    model.model.save_pretrained(save_path)
+    # 保存模型权重，处理DataParallel包装
+    model_to_save = model.model.module if hasattr(model.model, 'module') else model.model
+    model_to_save.save_pretrained(save_path)
     
     # 保存训练状态（优化器、调度器等）
     training_state = {
@@ -322,8 +330,10 @@ def main():
                        help="Number of data loader workers")
     
     # Model arguments
+    parser.add_argument("--pretrained", action="store_true", 
+                       help="Use pretrained model")
     parser.add_argument("--model_id", type=str, 
-                       default="microsoft/renderformer-v1.1-swin-large",
+                       default="microsoft/renderformer-v1-base",
                        help="Model ID on Hugging Face or local path")
     parser.add_argument("--precision", type=str, choices=['bf16', 'fp16', 'fp32'], 
                        default='fp16', help="Precision for training")
@@ -331,6 +341,8 @@ def main():
                        help="Resolution for training")
     parser.add_argument("--model_config", type=str, default="F:/projects/renderformer/traindata_test/model/config.json", 
                        help="Model config file")
+    parser.add_argument("--no_data_parallel", action="store_true", 
+                       help="Disable DataParallel for multi-GPU training")
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=1, 
@@ -363,12 +375,32 @@ def main():
     args = parser.parse_args()
     
     # Setup device
-    device = (torch.device('cuda') if torch.cuda.is_available() 
-              else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        num_gpus = torch.cuda.device_count()
+        print(f"Using {num_gpus} GPU(s): {device}")
+        if num_gpus > 1:
+            print(f"Multi-GPU training will be enabled with DataParallel")
+            # Adjust batch size for multi-GPU training
+            if args.batch_size % num_gpus != 0:
+                print(f"Warning: batch_size ({args.batch_size}) is not divisible by num_gpus ({num_gpus})")
+                print(f"Consider using a batch size that's divisible by {num_gpus} for optimal performance")
+    else:
+        device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
+        num_gpus = 1
+        print(f"Using device: {device}")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Setup logging file
+    log_file = os.path.join(args.output_dir, "training_log.txt")
+    with open(log_file, 'w') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"Training Log - Started at {timestamp}\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Arguments: {vars(args)}\n")
+        f.write("=" * 50 + "\n")
     
     # Initialize wandb if requested
     if args.use_wandb:
@@ -379,15 +411,17 @@ def main():
         )
     
     # Init model
-    print(f"Creating new GeoRaster model from scratch...")
-    model_config = RenderFormerConfig.from_json(args.model_config)
-    
-    # config = RenderFormerConfig(norm_first=True)
-    pipeline = GeoRasterRenderingPipeline(GeoRaster(model_config))
-    print("✓ New model created successfully")
+    if args.pretrained:
+        print(f"Loading pretrained model from {args.model_id}...")
+        pipeline = GeoRasterRenderingPipeline.from_pretrained(args.model_id)
+    else:
+        print(f"Creating new GeoRaster model from scratch...")
+        model_config = RenderFormerConfig.from_json(args.model_config)
+        pipeline = GeoRasterRenderingPipeline(GeoRaster(model_config))
+        print("✓ New model created successfully")
     
     # Apply optimizations
-    if device == torch.device('cuda') and os.name == 'posix':  # avoid windows
+    if device.type == 'cuda' and os.name == 'posix':  # avoid windows
         try:
             from renderformer_liger_kernel import apply_kernels
             apply_kernels(pipeline.model)
@@ -396,12 +430,19 @@ def main():
             print("Applied liger kernel optimizations")
         except ImportError:
             print("Liger kernel not available, skipping optimizations")
-    elif device == torch.device('mps'):
+    elif device.type == 'mps':
         args.precision = 'fp32'
         print("bf16 and fp16 will cause too large error in MPS, "
               "force using fp32 instead.")
     
     pipeline.to(device)
+    
+    # Enable multi-GPU training with DataParallel
+    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
+        pipeline.model = torch.nn.DataParallel(pipeline.model)
+        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
+    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
+        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
     
     # Create datasets and dataloaders
     train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution)
@@ -451,15 +492,31 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         
+        # Log epoch start
+        with open(log_file, 'a') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"\n[{timestamp}] Epoch {epoch+1}/{args.epochs}\n")
+            f.write("-" * 30 + "\n")
+        
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args)
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, log_file)
         print(f"Training loss: {train_loss:.6f}")
+        
+        # Log epoch training loss
+        with open(log_file, 'a') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] Epoch {epoch+1} Training Loss: {train_loss:.6f}\n")
         
         # Validate
         val_loss = None
         if val_dataloader is not None:
             val_loss = validate(pipeline, val_dataloader, device, args)
             print(f"Validation loss: {val_loss:.6f}")
+            
+            # Log epoch validation loss
+            with open(log_file, 'a') as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{timestamp}] Epoch {epoch+1} Validation Loss: {val_loss:.6f}\n")
             
             # Log to wandb
             if args.use_wandb:
@@ -472,6 +529,9 @@ def main():
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                with open(log_file, 'a') as f:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"[{timestamp}] New best model saved! Validation loss: {val_loss:.6f}\n")
                 save_checkpoint(
                     pipeline, optimizer, scheduler, epoch, val_loss,
                     os.path.join(args.output_dir, "best_model")
@@ -495,6 +555,16 @@ def main():
         pipeline, optimizer, scheduler, args.epochs-1, train_loss,
         os.path.join(args.output_dir, "final_model")
     )
+    
+    # Log training completion
+    with open(log_file, 'a') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write("\n" + "=" * 50 + "\n")
+        f.write(f"[{timestamp}] Training completed!\n")
+        f.write(f"Final training loss: {train_loss:.6f}\n")
+        if val_loss is not None:
+            f.write(f"Final validation loss: {val_loss:.6f}\n")
+        f.write("=" * 50 + "\n")
     
     print("Training completed!")
     

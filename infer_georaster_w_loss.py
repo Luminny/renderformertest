@@ -21,9 +21,12 @@ def load_single_h5_data(file_path):
         fov = torch.from_numpy(np.array(f['fov']).astype(np.float32))
 
         gt_images_exr_file = str(file_path).replace('.h5', '.exr')
-        gt_images = torch.from_numpy(
-            imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
-        ).unsqueeze(0)
+        if os.path.exists(gt_images_exr_file):
+            gt_images = torch.from_numpy(
+                    imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
+                ).unsqueeze(0)
+        else:
+            gt_images = None
 
         data = {
             'triangles': triangles,
@@ -44,6 +47,7 @@ def main():
     parser.add_argument("--resolution", type=int, default=256, help="Resolution for inference")
     parser.add_argument("--output_dir", type=str, help="Output directory (Default: same as input H5 file)", required=False)
     parser.add_argument("--tone_mapper", type=str, choices=['none', 'agx', 'filmic', 'pbr_neutral'], default='none', help="Tone mapper for inference")
+    parser.add_argument("--with-loss", action="store_true", help="Compute loss")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -88,8 +92,9 @@ def main():
     )
     print("Inference completed. Rendered images shape:", rendered_imgs.shape)
     
-    loss = compute_loss(rendered_imgs, data['gt_img'].to(device), 'l1')
-    print(f"Loss: {loss}")
+    if args.with_loss:
+        loss = compute_loss(rendered_imgs, data['gt_img'].to(device), 'l1')
+        print(f"Loss: {loss}")
 
     output_dir = args.output_dir if args.output_dir else os.path.dirname(args.h5_file)
     os.makedirs(output_dir, exist_ok=True)

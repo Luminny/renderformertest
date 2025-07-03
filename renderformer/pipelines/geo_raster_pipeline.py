@@ -8,8 +8,8 @@ from renderformer.utils.transform import trans_to_cam_coord
 class GeoRasterRenderingPipeline:
     def __init__(self, model: GeoRaster):
         self.model = model
-        self.config = model.config
-        self.ray_generator = RayGenerator().to(model.device)
+        self.config = model.config if hasattr(model, 'config') else model.module.config
+        self.ray_generator = RayGenerator().to(self._get_model_device())
 
     @classmethod
     def from_pretrained(cls, model_id: str):
@@ -17,13 +17,23 @@ class GeoRasterRenderingPipeline:
         model.eval()
         return cls(model)
 
+    def _get_model_device(self):
+        """Get device from model, handling DataParallel wrapper"""
+        if hasattr(self.model, 'module'):
+            # DataParallel wrapped model
+            return next(self.model.module.parameters()).device
+        else:
+            # Regular model
+            return next(self.model.parameters()).device
+
     @property
     def device(self):
-        return self.model.device
+        return self._get_model_device()
 
     def to(self, device: torch.device):
         self.model.to(device)
         self.ray_generator.to(device)
+        return self
 
     def render(
         self,

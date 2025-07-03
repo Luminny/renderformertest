@@ -10,21 +10,55 @@ from simple_ocio import ToneMapper
 
 from train_geo_raster import compute_loss
 
+def create_default_texture(num_tris):
+    size = 32
+    mask = np.zeros((size, size), dtype=bool)
+    x, y = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
+    mask[x + y <= size] = 1
+
+    diffuse = np.ones((num_tris, 3))
+    specular = np.ones((num_tris, 3))
+    roughness = np.ones((num_tris, 1))
+    normal = np.zeros_like(diffuse)
+    normal[..., 0] = 0.5
+    normal[..., 1] = 0.5
+    normal[..., 2] = 1.
+    irradiance = np.zeros((num_tris, 3))
+    irradiance[0:3] = 5000
+    texture = np.concatenate([diffuse, specular, roughness, normal, irradiance], axis=1)
+    texture = np.repeat(np.repeat(texture[..., None], size, axis=-1)[..., None], size, axis=-1)
+    texture[:, :, ~mask] = 0.0
+    print(f"Texture: {np.max(texture)}, {np.min(texture)}, {texture.shape}")
+    return texture
+
 
 def load_single_h5_data(file_path):
     with h5py.File(file_path, 'r') as f:
         triangles = torch.from_numpy(np.array(f['triangles']).astype(np.float32))
         num_tris = triangles.shape[0]
-        texture = torch.from_numpy(np.array(f['texture']).astype(np.float32))
+        # if 'texture' in f:
+        if False:
+            texture = torch.from_numpy(np.array(f['texture']).astype(np.float32))
+            # print(f"Using texture from h5 file: {texture}")
+        else:
+            texture = torch.from_numpy(create_default_texture(num_tris).astype(np.float32))
+        
+        # texture = texture + 0.15 * torch.randn_like(texture)
+        # print(f"Texture: {torch.max(texture)}, {torch.min(texture)}")
+        # texture = texture + 0.4 * torch.randn_like(texture) * texture
+        # print(f"Texture: {torch.max(texture)}, {torch.min(texture)}")
         mask = torch.ones(num_tris, dtype=torch.bool)
         vn = torch.from_numpy(np.array(f['vn']).astype(np.float32))
         c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
         fov = torch.from_numpy(np.array(f['fov']).astype(np.float32))
 
         gt_images_exr_file = str(file_path).replace('.h5', '.exr')
-        gt_images = torch.from_numpy(
-            imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
-        ).unsqueeze(0)
+        if os.path.exists(gt_images_exr_file):
+            gt_images = torch.from_numpy(
+                    imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
+                ).unsqueeze(0)
+        else:
+            gt_images = None
 
         data = {
             'triangles': triangles,
@@ -46,6 +80,7 @@ def main():
     parser.add_argument("--resolution", type=int, default=512, help="Resolution for inference")
     parser.add_argument("--output_dir", type=str, help="Output directory (Default: same as input H5 file)", required=False)
     parser.add_argument("--tone_mapper", type=str, choices=['none', 'agx', 'filmic', 'pbr_neutral'], default='none', help="Tone mapper for inference")
+    parser.add_argument("--with-loss", action="store_true", help="Compute loss")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -92,8 +127,9 @@ def main():
     )
     print("Inference completed. Rendered images shape:", rendered_imgs.shape)
     
-    loss = compute_loss(rendered_imgs, data['gt_img'].to(device), 'l1')
-    print(f"Loss: {loss}")
+    if args.with_loss:  
+        loss = compute_loss(rendered_imgs, data['gt_img'].to(device), 'l1')
+        print(f"Loss: {loss}")
 
     output_dir = args.output_dir if args.output_dir else os.path.dirname(args.h5_file)
     os.makedirs(output_dir, exist_ok=True)
