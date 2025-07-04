@@ -12,6 +12,7 @@ import wandb
 from pathlib import Path
 import imageio
 from datetime import datetime
+import lpips
 
 from renderformer import GeoRasterRenderingPipeline
 from renderformer.models.config import RenderFormerConfig
@@ -101,6 +102,20 @@ class RenderFormerDataset(Dataset):
         return data
 
 
+loss_fn_alex = lpips.LPIPS(net='alex') # best forward scores
+# loss_fn_vgg = lpips.LPIPS(net='vgg') # closer to "traditional" perceptual loss, when used for optimization
+
+def convert_for_lpips(img):
+    # clip to [0, 1]
+    img = torch.clamp(img, 0, 1)
+    # normalize to [-1, 1]
+    img = (img - 0.5) * 2
+    # [B, V, H, W, 3] -> [B*V, 3, H, W]
+    img = img.reshape(-1, *img.shape[-3:]).permute(0, 3, 1, 2)
+    # print(img.shape)
+    # print(img.device)
+    return img
+
 def compute_loss(pred_images, gt_images, loss_type='l1'):
     """Compute loss between predicted and ground truth images"""
     if loss_type == 'l1':
@@ -111,6 +126,12 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
         return F.mse_loss(pred_images, gt_images)
     elif loss_type == 'smooth_l1':
         return F.smooth_l1_loss(pred_images, gt_images)
+    elif loss_type == 'lpips_alex':
+        return loss_fn_alex(convert_for_lpips(pred_images), convert_for_lpips(gt_images))
+    # elif loss_type == 'lpips_vgg':
+    #     return loss_fn_vgg(convert_for_lpips(pred_images), convert_for_lpips(gt_images))
+    elif loss_type == 'l1_w_lpips_alex':
+        return F.l1_loss(pred_images, gt_images) + 0.05 * loss_fn_alex(convert_for_lpips(pred_images), convert_for_lpips(gt_images)).mean()
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -156,6 +177,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             if gt_images is not None:
                 loss = compute_loss(rendered_imgs, gt_images, 
                                   config.loss_type)
+                # Handle multi-GPU training - convert tensor loss to scalar
+                if hasattr(loss, 'mean'):
+                    loss = loss.mean()
             else:
                 print(f"gt_images is None")
             
@@ -339,6 +363,8 @@ def main():
                        default='fp16', help="Precision for training")
     parser.add_argument("--resolution", type=int, default=256, 
                        help="Resolution for training")
+    parser.add_argument("--max_num_tris", type=int, default=2048, 
+                       help="Maximum number of triangles for training")
     parser.add_argument("--model_config", type=str, default="F:/projects/renderformer/traindata_test/model/config.json", 
                        help="Model config file")
     parser.add_argument("--no_data_parallel", action="store_true", 
@@ -353,7 +379,7 @@ def main():
                        help="Weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, 
                        help="Gradient clipping value")
-    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'smooth_l1'], 
+    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'smooth_l1', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex'], 
                        default='l1', help="Loss function type")
     
     # Output arguments
@@ -436,6 +462,7 @@ def main():
               "force using fp32 instead.")
     
     pipeline.to(device)
+    loss_fn_alex.to(device)
     
     # Enable multi-GPU training with DataParallel
     if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
@@ -445,7 +472,7 @@ def main():
         print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
     
     # Create datasets and dataloaders
-    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution)
+    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris)
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
@@ -487,6 +514,8 @@ def main():
     #     )
     #     pipeline.to(device)
     #     print(f"Resuming training from epoch {start_epoch}")
+
+    # log trainning parameters
     
     # Training loop
     for epoch in range(start_epoch, args.epochs):
@@ -544,7 +573,7 @@ def main():
                 })
         
         # Save checkpoint periodically
-        if (epoch + 1) % args.save_freq == 0:
+        if (epoch + 1) % args.save_freq == 1:
             save_checkpoint(
                 pipeline, optimizer, scheduler, epoch, train_loss,
                 os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
