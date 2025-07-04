@@ -1,3 +1,24 @@
+"""
+RenderFormer Training Script with TensorBoard and Wandb Support
+
+This script provides comprehensive training for RenderFormer models with:
+- TensorBoard visualization for loss curves, gradients, and sample images
+- Wandb integration for experiment tracking
+- Multi-GPU support with DataParallel
+- Flexible loss functions (L1, L2, LPIPS)
+- Checkpoint saving and resuming
+
+Usage:
+    # Basic training with TensorBoard
+    python train_geo_raster.py --train_data_dir /path/to/data --use_tensorboard
+    
+    # View TensorBoard logs
+    tensorboard --logdir ./tensorboard_logs
+    
+    # Training with both TensorBoard and Wandb
+    python train_geo_raster.py --train_data_dir /path/to/data --use_tensorboard --use_wandb
+"""
+
 import os
 import torch
 import h5py
@@ -7,6 +28,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
 from pathlib import Path
@@ -136,7 +158,7 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_file=None):
+def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_file=None, tb_writer=None, epoch=0):
     """Train for one epoch"""
     model.model.train()
     total_loss = 0.0
@@ -203,6 +225,39 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
                 with open(log_file, 'a') as f:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     f.write(f"[{timestamp}] Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {scheduler.get_last_lr()[0]:.2e}\n")
+            
+            # Log to TensorBoard
+            if tb_writer:
+                global_step = epoch * len(dataloader) + batch_idx
+                tb_writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+                tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
+                
+                # Log gradient norms every 100 steps
+                if global_step % 100 == 0:
+                    total_grad_norm = 0.0
+                    for name, param in model.model.named_parameters():
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2).item()
+                            total_grad_norm += param_norm ** 2
+                    total_grad_norm = total_grad_norm ** 0.5
+                    tb_writer.add_scalar('Gradients/Total_Norm', total_grad_norm, global_step)
+                
+                # Log sample images every 500 steps
+                if global_step % 50 == 0 and gt_images is not None:
+                    # Take first image from batch for visualization
+                    pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
+                    gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
+                    
+                    # Convert to format for TensorBoard (CHW)
+                    pred_img = pred_img.permute(2, 0, 1)  # [3, H, W]
+                    gt_img = gt_img.permute(2, 0, 1)  # [3, H, W]
+
+                    # concatenate pred_img and gt_img
+                    concat_img = torch.cat([pred_img, gt_img], dim=2)
+                    
+                    # tb_writer.add_image('Images/Prediction', pred_img, global_step)
+                    # tb_writer.add_image('Images/Ground_Truth', gt_img, global_step)
+                    tb_writer.add_image('Images/Prediction_Ground_Truth', concat_img, global_step)
             
             # Update progress bar
             progress_bar.set_postfix({
@@ -397,6 +452,10 @@ def main():
                        help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, 
                        help="W&B run name")
+    parser.add_argument("--use_tensorboard", action="store_true", 
+                       help="Use TensorBoard for logging")
+    parser.add_argument("--tensorboard_log_dir", type=str, default="./tensorboard_logs", 
+                       help="TensorBoard log directory")
     
     args = parser.parse_args()
     
@@ -435,6 +494,30 @@ def main():
             name=args.wandb_run_name,
             config=vars(args)
         )
+    
+    # Initialize TensorBoard if requested
+    tb_writer = None
+    if args.use_tensorboard:
+        tb_log_dir = os.path.join(args.tensorboard_log_dir, 
+                                 f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(tb_log_dir, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
+        print(f"TensorBoard logs will be saved to: {tb_log_dir}")
+        print(f"Run 'tensorboard --logdir {args.tensorboard_log_dir}' to view logs")
+        
+        # Log hyperparameters to TensorBoard
+        hparams_dict = {
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'weight_decay': args.weight_decay,
+            'resolution': args.resolution,
+            'max_num_tris': args.max_num_tris,
+            'precision': args.precision,
+            'loss_type': args.loss_type,
+            'grad_clip': args.grad_clip,
+            'epochs': args.epochs
+        }
+        tb_writer.add_hparams(hparams_dict, {'hparam/train_loss': 0.0})
     
     # Init model
     if args.pretrained:
@@ -528,8 +611,12 @@ def main():
             f.write("-" * 30 + "\n")
         
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, log_file)
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, log_file, tb_writer, epoch)
         print(f"Training loss: {train_loss:.6f}")
+        
+        # Log epoch training loss to TensorBoard
+        if tb_writer:
+            tb_writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
         
         # Log epoch training loss
         with open(log_file, 'a') as f:
@@ -546,6 +633,10 @@ def main():
             with open(log_file, 'a') as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"[{timestamp}] Epoch {epoch+1} Validation Loss: {val_loss:.6f}\n")
+            
+            # Log to TensorBoard
+            if tb_writer:
+                tb_writer.add_scalar('Loss/Validation_Epoch', val_loss, epoch)
             
             # Log to wandb
             if args.use_wandb:
@@ -596,6 +687,17 @@ def main():
         f.write("=" * 50 + "\n")
     
     print("Training completed!")
+    
+    # Close TensorBoard writer
+    if tb_writer:
+        # Update final hparams with actual results
+        final_metrics = {'hparam/train_loss': train_loss}
+        if val_loss is not None:
+            final_metrics['hparam/val_loss'] = val_loss
+        tb_writer.add_hparams(hparams_dict, final_metrics)
+        
+        tb_writer.close()
+        print(f"TensorBoard logs saved to: {tb_log_dir}")
     
     if args.use_wandb:
         wandb.finish()
