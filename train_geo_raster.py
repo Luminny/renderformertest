@@ -138,6 +138,55 @@ def convert_for_lpips(img):
     # print(img.device)
     return img
 
+def compute_gradient_stats_by_module(model):
+    """
+    Compute gradient statistics by module for visualization and debugging.
+    
+    Args:
+        model: The model to analyze
+        
+    Returns:
+        Dict containing gradient statistics for each module
+    """
+    # Handle DataParallel wrapper
+    if hasattr(model, 'module'):
+        model = model.module
+    
+    # Define module groups based on the model structure
+    module_groups = {
+        'embeddings': ['tri_token', 'reg_tokens'],
+        'vn_encoding': ['vn_encoding_proj', 'vn_encoder_norm'],
+        'transformer': ['transformer.layers'],
+        'view_transformer_core': ['view_transformer.transformer'],
+        'view_transformer_encoder': ['view_transformer.ray_map_patch_token', 'view_transformer.ray_map_encoder', 'view_transformer.ray_map_encoder_norm'],
+        'view_transformer_output': ['view_transformer.out_dpt'],
+        'rope_embeddings': ['rope_emb']
+    }
+    
+    gradient_stats = {}
+    
+    for group_name, module_prefixes in module_groups.items():
+        grad_tensors = []
+        
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # Check if this parameter belongs to the current module group
+                for prefix in module_prefixes:
+                    if name.startswith(prefix):
+                        grad_tensors.append(param.grad.data.flatten())
+                        break
+        
+        if grad_tensors:
+            # Concatenate all gradient tensors for this module group
+            all_grads = torch.cat(grad_tensors, dim=0)
+            gradient_stats[group_name] = {
+                'mean': all_grads.mean().item(),
+                'max': all_grads.max().item(),
+            }
+    
+    return gradient_stats
+
+
 def compute_loss(pred_images, gt_images, loss_type='l1'):
     """Compute loss between predicted and ground truth images"""
     if loss_type == 'l1':
@@ -232,15 +281,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
                 tb_writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
                 tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
                 
-                # Log gradient norms every 100 steps
-                if global_step % 100 == 0:
-                    total_grad_norm = 0.0
-                    for name, param in model.model.named_parameters():
-                        if param.grad is not None:
-                            param_norm = param.grad.data.norm(2).item()
-                            total_grad_norm += param_norm ** 2
-                    total_grad_norm = total_grad_norm ** 0.5
-                    tb_writer.add_scalar('Gradients/Total_Norm', total_grad_norm, global_step)
+                # Log gradient norms by module every 100 steps
+                if global_step % 50 == 1:
+                    gradient_stats = compute_gradient_stats_by_module(model.model)
+                    for module_name, stats in gradient_stats.items():
+                        tb_writer.add_scalar(f'Gradients/{module_name}/Mean', stats['mean'], global_step)
+                        tb_writer.add_scalar(f'Gradients/{module_name}/Max', stats['max'], global_step)
                 
                 # Log sample images every 500 steps
                 if global_step % 50 == 0 and gt_images is not None:
@@ -255,8 +301,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
                     # concatenate pred_img and gt_img
                     concat_img = torch.cat([pred_img, gt_img], dim=2)
                     
-                    # tb_writer.add_image('Images/Prediction', pred_img, global_step)
-                    # tb_writer.add_image('Images/Ground_Truth', gt_img, global_step)
                     tb_writer.add_image('Images/Prediction_Ground_Truth', concat_img, global_step)
             
             # Update progress bar
@@ -454,8 +498,6 @@ def main():
                        help="W&B run name")
     parser.add_argument("--use_tensorboard", action="store_true", 
                        help="Use TensorBoard for logging")
-    parser.add_argument("--tensorboard_log_dir", type=str, default="./tensorboard_logs", 
-                       help="TensorBoard log directory")
     
     args = parser.parse_args()
     
@@ -498,12 +540,12 @@ def main():
     # Initialize TensorBoard if requested
     tb_writer = None
     if args.use_tensorboard:
-        tb_log_dir = os.path.join(args.tensorboard_log_dir, 
+        tb_log_dir = os.path.join(args.output_dir, 
                                  f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(tb_log_dir, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         print(f"TensorBoard logs will be saved to: {tb_log_dir}")
-        print(f"Run 'tensorboard --logdir {args.tensorboard_log_dir}' to view logs")
+        print(f"Run 'tensorboard --logdir {args.output_dir}' to view logs")
         
         # Log hyperparameters to TensorBoard
         hparams_dict = {
@@ -600,6 +642,20 @@ def main():
 
     # log trainning parameters
     
+    # Print gradient monitoring info
+    if args.use_tensorboard:
+        print("\n" + "="*60)
+        print("GRADIENT MONITORING ENABLED")
+        print("="*60)
+        print("The following gradient statistics will be logged to TensorBoard:")
+        print("- Module-level gradient norms, means, stds, max, min")
+        print("- Per-layer statistics for transformer layers")
+        print("- Both per-batch (every 100 steps) and per-epoch statistics")
+        print("TensorBoard sections:")
+        print("  - Gradients/* : Per-batch gradient statistics")
+        print("  - Gradients_Epoch/* : Per-epoch gradient statistics")
+        print("="*60)
+    
     # Training loop
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
@@ -617,11 +673,25 @@ def main():
         # Log epoch training loss to TensorBoard
         if tb_writer:
             tb_writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
+            
+            # Log gradient statistics at epoch end
+            gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+            for module_name, stats in gradient_stats.items():
+                tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Mean', stats['mean'], epoch)
+                tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Max', stats['max'], epoch)
         
-        # Log epoch training loss
+        # Log epoch training loss and gradient statistics
         with open(log_file, 'a') as f:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"[{timestamp}] Epoch {epoch+1} Training Loss: {train_loss:.6f}\n")
+            
+            # Log gradient statistics to file
+            if tb_writer:  # Only log if TensorBoard is enabled
+                gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+                f.write(f"[{timestamp}] Gradient Statistics:\n")
+                for module_name, stats in gradient_stats.items():
+                    f.write(f"  {module_name}: mean={stats['mean']:.2e}, max={stats['max']:.2e}\n")
+                f.write("\n")
         
         # Validate
         val_loss = None

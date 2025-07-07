@@ -302,7 +302,7 @@ def main():
     # Move to device
     pipeline.to(device)
     
-    # print(f"Model: {pipeline.model}")
+    print(f"Model: {pipeline.model}")
     print(f"Model type: {type(pipeline.model)}")
     
     # Print detailed parameter summary
