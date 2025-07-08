@@ -45,8 +45,9 @@ def _make_scratch(in_shape, out_shape, groups=1, expand=False):
         in_shape[0], out_shape1, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
     scratch.layer2_rn = nn.Conv2d(
         in_shape[1], out_shape2, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
-    scratch.layer3_rn = nn.Conv2d(
-        in_shape[2], out_shape3, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
+    if len(in_shape) >= 3:
+        scratch.layer3_rn = nn.Conv2d(
+            in_shape[2], out_shape3, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
     if len(in_shape) >= 4:
         scratch.layer4_rn = nn.Conv2d(
             in_shape[3], out_shape4, kernel_size=3, stride=1, padding=1, bias=False, groups=groups)
@@ -246,8 +247,11 @@ class DPTHead(nn.Module):
             x = x.permute(0, 2, 1).reshape(
                 (x.shape[0], x.shape[-1], patch_h, patch_w))
 
+            print(f"x.shape: {x.shape}")
             x = self.projects[i](x)
+            print(f"x.projects: {x.shape}")
             x = self.resize_layers[i](x)
+            print(f"x.resize_layers: {x.shape}")
 
             out.append(x)
 
@@ -258,11 +262,109 @@ class DPTHead(nn.Module):
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
 
+        # print(f"layer_4_rn.shape: {layer_4_rn.shape}")
+        # print(f"layer_3_rn.shape: {layer_3_rn.shape}")
+        # print(f"layer_2_rn.shape: {layer_2_rn.shape}")
+        # print(f"layer_1_rn.shape: {layer_1_rn.shape}")
+
         path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
         path_3 = self.scratch.refinenet3(
             path_4, layer_3_rn, size=layer_2_rn.shape[2:])
         path_2 = self.scratch.refinenet2(
             path_3, layer_2_rn, size=layer_1_rn.shape[2:])
+        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
+
+        # print(f"path_1.shape: {path_1.shape}")
+        # print(f"path_2.shape: {path_2.shape}")
+        # print(f"path_3.shape: {path_3.shape}")
+        # print(f"path_4.shape: {path_4.shape}")
+
+        out = self.scratch.output_conv1(path_1)
+        # print(f"out.shape: {out.shape}")
+        out = F.interpolate(out, (int(patch_h * patch_size),
+                            int(patch_w * patch_size)), mode="bilinear", align_corners=True)
+        # print(f"out.shape: {out.shape}")
+        out = self.scratch.output_conv2(out)
+        # print(f"out.shape: {out.shape}")
+        return out
+
+
+class DPTHead2(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        features=256,
+        out_channels=[128, 384],
+        out_dim=3,
+    ):
+        super(DPTHead2, self).__init__()
+
+        self.projects = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channel,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+            ) for out_channel in out_channels
+        ])
+
+        self.resize_layers = nn.ModuleList([
+            nn.ConvTranspose2d(
+                in_channels=out_channels[0],
+                out_channels=out_channels[0],
+                kernel_size=2,
+                stride=2,
+                padding=0),
+            nn.Conv2d(
+                in_channels=out_channels[1],
+                out_channels=out_channels[1],
+                kernel_size=3,
+                stride=2,
+                padding=1)
+        ])
+
+        self.scratch = _make_scratch(
+            out_channels,
+            features,
+            groups=1,
+            expand=False,
+        )
+
+        self.scratch.refinenet1 = _make_fusion_block(features)
+        self.scratch.refinenet2 = _make_fusion_block(
+            features, no_resconv1=True)
+
+        head_features_1 = features
+        head_features_2 = 32
+
+        self.scratch.output_conv1 = nn.Conv2d(
+            head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1)
+        self.scratch.output_conv2 = nn.Sequential(
+            nn.Conv2d(head_features_1 // 2, head_features_2,
+                      kernel_size=3, stride=1, padding=1),
+            nn.SiLU(True),
+            nn.Conv2d(head_features_2, out_dim,
+                      kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, out_features, patch_h, patch_w, patch_size=16):
+        out = []
+        for i, x in enumerate(out_features):
+            x = x[0]
+            x = x.permute(0, 2, 1).reshape(
+                (x.shape[0], x.shape[-1], patch_h, patch_w))
+
+            x = self.projects[i](x)
+            x = self.resize_layers[i](x)
+            out.append(x)
+
+        layer_1, layer_2 = out
+
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+
+        path_2 = self.scratch.refinenet2(layer_2_rn, size=layer_1_rn.shape[2:])
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
         out = self.scratch.output_conv1(path_1)

@@ -4,7 +4,7 @@ import torch.nn as nn
 from renderformer.models.config import RenderFormerConfig
 from renderformer.encodings.nerf_encoding import NeRFEncoding
 from renderformer.layers.attention import TransformerDecoder
-from renderformer.layers.dpt import DPTHead
+from renderformer.layers.dpt import DPTHead, DPTHead2
 
 from einops import rearrange
 
@@ -75,6 +75,14 @@ class ViewTransformer(nn.Module):
         )
         if not config.use_dpt_decoder:
             self.out_proj = nn.Linear(self.config.view_transformer_latent_dim, self.config.patch_size * self.config.patch_size * (4 if config.include_alpha else 3))
+        elif self.config.dpt_out_layers is not None and len(self.config.dpt_out_layers) == 2:
+            self.out_dpt = DPTHead2(
+                in_channels=self.config.view_transformer_latent_dim,
+                features=self.config.dpt_features,
+                out_channels=self.config.dpt_out_channels,
+                out_dim=4 if config.include_alpha else 3
+            )
+            self.out_layers = list(self.config.dpt_out_layers)
         else:
             self.out_dpt = DPTHead(
                 in_channels=self.config.view_transformer_latent_dim,

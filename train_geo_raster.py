@@ -404,10 +404,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
         'loss': loss,
     }
     
-    # # 保存训练状态到 JSON 文件
-    # import json
-    # with open(os.path.join(save_path, 'training_state.json'), 'w') as f:
-    #     json.dump(training_state, f, indent=2)
+    # 保存训练状态到 PyTorch 文件（因为包含tensors，不能用JSON）
+    torch.save(training_state, os.path.join(save_path, 'training_state.pt'))
     
     print(f"Model saved to {save_path} in Hugging Face format")
 
@@ -418,11 +416,9 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     model = model.from_pretrained(checkpoint_path)
     
     # 加载训练状态
-    training_state_path = os.path.join(checkpoint_path, 'training_state.json')
+    training_state_path = os.path.join(checkpoint_path, 'training_state.pt')
     if os.path.exists(training_state_path):
-        import json
-        with open(training_state_path, 'r') as f:
-            training_state = json.load(f)
+        training_state = torch.load(training_state_path, map_location='cpu')
         
         # 恢复优化器和调度器状态
         optimizer.load_state_dict(training_state['optimizer_state_dict'])
@@ -586,16 +582,6 @@ def main():
         print("bf16 and fp16 will cause too large error in MPS, "
               "force using fp32 instead.")
     
-    pipeline.to(device)
-    loss_fn_alex.to(device)
-    
-    # Enable multi-GPU training with DataParallel
-    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
-        pipeline.model = torch.nn.DataParallel(pipeline.model)
-        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
-    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
-        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
-    
     # Create datasets and dataloaders
     train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris)
     train_dataloader = DataLoader(
@@ -633,14 +619,21 @@ def main():
      # Resume from checkpoint if specified
     start_epoch = 0
     best_val_loss = float('inf')
-    # if args.resume_from:
-    #     pipeline, optimizer, scheduler, start_epoch, best_val_loss = load_checkpoint(
-    #         pipeline, optimizer, scheduler, args.resume_from
-    #     )
-    #     pipeline.to(device)
-    #     print(f"Resuming training from epoch {start_epoch}")
+    if args.resume_from:
+        pipeline, optimizer, scheduler, start_epoch, best_val_loss = load_checkpoint(
+            pipeline, optimizer, scheduler, args.resume_from
+        )
+        print(f"Resuming training from epoch {start_epoch}")
 
-    # log trainning parameters
+    # Enable multi-GPU training with DataParallel
+    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
+        pipeline.model = torch.nn.DataParallel(pipeline.model)
+        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
+    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
+        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
+
+    pipeline.to(device)
+    loss_fn_alex.to(device)
     
     # Print gradient monitoring info
     if args.use_tensorboard:
