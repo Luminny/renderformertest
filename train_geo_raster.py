@@ -410,11 +410,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
     print(f"Model saved to {save_path} in Hugging Face format")
 
 
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+def load_training_state(optimizer, scheduler, checkpoint_path):
     """Load model checkpoint from Hugging Face format"""
-    # 加载模型权重
-    model = model.from_pretrained(checkpoint_path)
-    
     # 加载训练状态
     training_state_path = os.path.join(checkpoint_path, 'training_state.pt')
     if os.path.exists(training_state_path):
@@ -424,15 +421,14 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
         optimizer.load_state_dict(training_state['optimizer_state_dict'])
         scheduler.load_state_dict(training_state['scheduler_state_dict'])
         
-        print(f"Loaded checkpoint from {checkpoint_path}")
         print(f"Resuming from epoch {training_state['epoch']} "
               f"with loss {training_state['loss']}")
         
-        return (model, optimizer, scheduler, training_state['epoch'],
+        return (optimizer, scheduler, training_state['epoch'],
                 training_state['loss'])
     else:
         print(f"No training state found at {training_state_path}")
-        return model, optimizer, scheduler, 0, float('inf')
+        return optimizer, scheduler, 0, float('inf')
 
 
 def main():
@@ -558,7 +554,10 @@ def main():
         tb_writer.add_hparams(hparams_dict, {'hparam/train_loss': 0.0})
     
     # Init model
-    if args.pretrained:
+    if args.resume_from:
+        print(f"Loading checkpoint from {args.resume_from}...")
+        pipeline = GeoRasterRenderingPipeline.from_pretrained(args.resume_from)
+    elif args.pretrained:
         print(f"Loading pretrained model from {args.model_id}...")
         pipeline = GeoRasterRenderingPipeline.from_pretrained(args.model_id)
     else:
@@ -566,6 +565,14 @@ def main():
         model_config = RenderFormerConfig.from_json(args.model_config)
         pipeline = GeoRasterRenderingPipeline(GeoRaster(model_config))
         print("✓ New model created successfully")
+
+    # Enable multi-GPU training with DataParallel
+    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
+        pipeline.model = torch.nn.DataParallel(pipeline.model)
+        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
+    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
+        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
+
     
     # Apply optimizations
     if device.type == 'cuda' and os.name == 'posix':  # avoid windows
@@ -581,6 +588,9 @@ def main():
         args.precision = 'fp32'
         print("bf16 and fp16 will cause too large error in MPS, "
               "force using fp32 instead.")
+
+    pipeline.to(device)
+    loss_fn_alex.to(device)
     
     # Create datasets and dataloaders
     train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris)
@@ -620,20 +630,8 @@ def main():
     start_epoch = 0
     best_val_loss = float('inf')
     if args.resume_from:
-        pipeline, optimizer, scheduler, start_epoch, best_val_loss = load_checkpoint(
-            pipeline, optimizer, scheduler, args.resume_from
-        )
+        optimizer, scheduler, start_epoch, best_val_loss = load_training_state(optimizer, scheduler, args.resume_from)
         print(f"Resuming training from epoch {start_epoch}")
-
-    # Enable multi-GPU training with DataParallel
-    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
-        pipeline.model = torch.nn.DataParallel(pipeline.model)
-        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
-    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
-        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
-
-    pipeline.to(device)
-    loss_fn_alex.to(device)
     
     # Print gradient monitoring info
     if args.use_tensorboard:
