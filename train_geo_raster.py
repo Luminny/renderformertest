@@ -46,7 +46,7 @@ class RenderFormerDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.max_num_tris = max_num_tris
-        self.h5_files = list(self.data_dir.glob("*.h5"))
+        self.h5_files = list(self.data_dir.glob("*/*.h5"))
         
         if len(self.h5_files) == 0:
             raise ValueError(f"No H5 files found in {data_dir}")
