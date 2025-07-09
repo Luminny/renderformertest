@@ -247,11 +247,11 @@ class DPTHead(nn.Module):
             x = x.permute(0, 2, 1).reshape(
                 (x.shape[0], x.shape[-1], patch_h, patch_w))
 
-            print(f"x.shape: {x.shape}")
+            # print(f"x.shape: {x.shape}")
             x = self.projects[i](x)
-            print(f"x.projects: {x.shape}")
+            # print(f"x.projects: {x.shape}")
             x = self.resize_layers[i](x)
-            print(f"x.resize_layers: {x.shape}")
+            # print(f"x.resize_layers: {x.shape}")
 
             out.append(x)
 

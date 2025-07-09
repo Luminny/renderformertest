@@ -4,16 +4,16 @@ Simple script to upload/download zip files to/from S3 bucket.
 
 Usage examples:
   # Upload a zip file
-  python traindata_upload_s3.py path/to/your/file.zip
+  python s3_tools.py path/to/your/file.zip
   
   # Download a zip file  
-  python traindata_upload_s3.py --download renderformer/traindata/file.zip
+  python s3_tools.py --download --s3-path "renderformer/traindata/tri1024/000-000.zip" "./"
   
   # List files in S3 bucket
-  python traindata_upload_s3.py --list
+  python s3_tools.py --list
   
   # Test connection
-  python traindata_upload_s3.py --test-connection
+  python s3_tools.py --test-connection
 """
 
 import os
