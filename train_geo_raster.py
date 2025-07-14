@@ -26,7 +26,7 @@ import argparse
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -268,6 +268,9 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             
             optimizer.step()
             
+            # Step scheduler every batch for warmup + cosine decay
+            scheduler.step()
+            
             total_loss += loss.item()
             num_batches += 1
             
@@ -328,7 +331,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             else:
                 raise e
     
-    scheduler.step()
+    # scheduler.step() is now called after each batch, not at epoch end
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
 
@@ -441,8 +444,8 @@ def main():
                        help="Directory containing training H5 files")
     parser.add_argument("--val_data_dir", type=str, 
                        help="Directory containing validation H5 files")
-    parser.add_argument("--batch_size", type=int, default=16, 
-                       help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=128, 
+                       help="Batch size for training (paper recommends 128)")
     parser.add_argument("--num_workers", type=int, default=8, 
                        help="Number of data loader workers")
     
@@ -474,6 +477,12 @@ def main():
                        help="Gradient clipping value")
     parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'smooth_l1', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex'], 
                        default='l1', help="Loss function type")
+    parser.add_argument("--warmup_steps", type=int, default=8000, 
+                       help="Number of warmup steps for learning rate")
+    parser.add_argument("--cosine_decay_steps", type=int, default=None, 
+                       help="Number of steps for cosine decay (if None, use total training steps)")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01, 
+                       help="Minimum learning rate as ratio of target LR (default: 0.01 = 1%)")
     
     # Output arguments
     parser.add_argument("--output_dir", type=str, default="./checkpoints", 
@@ -516,14 +525,14 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # # Setup logging file
-    # log_file = os.path.join(args.output_dir, "training_log.txt")
-    # with open(log_file, 'w') as f:
-    #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    #     f.write(f"Training Log - Started at {timestamp}\n")
-    #     f.write("=" * 50 + "\n")
-    #     f.write(f"Arguments: {vars(args)}\n")
-    #     f.write("=" * 50 + "\n")
+    # Setup logging file
+    log_file = os.path.join(args.output_dir, "training_log.txt")
+    with open(log_file, 'w') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"Training Log - Started at {timestamp}\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Arguments: {vars(args)}\n")
+        f.write("=" * 50 + "\n")
     
     # Initialize wandb if requested
     if args.use_wandb:
@@ -542,20 +551,6 @@ def main():
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         print(f"TensorBoard logs will be saved to: {tb_log_dir}")
         print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
-        
-        # Log hyperparameters to TensorBoard
-        hparams_dict = {
-            'batch_size': args.batch_size,
-            'learning_rate': args.learning_rate,
-            'weight_decay': args.weight_decay,
-            'resolution': args.resolution,
-            'max_num_tris': args.max_num_tris,
-            'precision': args.precision,
-            'loss_type': args.loss_type,
-            'grad_clip': args.grad_clip,
-            'epochs': args.epochs
-        }
-        tb_writer.add_hparams(hparams_dict, {'hparam/train_loss': 0.0})
     
     # Init model
     if args.resume_from:
@@ -624,11 +619,61 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    scheduler = CosineAnnealingLR(
-        optimizer, 
-        T_max=args.epochs,
-        eta_min=args.learning_rate * 0.1
+    # Calculate total training steps
+    total_steps = len(train_dataloader) * args.epochs
+    
+    # Setup learning rate scheduler with warmup + cosine decay
+    if args.cosine_decay_steps is None:
+        cosine_decay_steps = total_steps - args.warmup_steps
+    else:
+        cosine_decay_steps = args.cosine_decay_steps
+    
+    # Create warmup scheduler (linear increase from 0 to target LR)
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,  # Start from 1% of target LR
+        end_factor=1.0,     # End at 100% of target LR
+        total_iters=args.warmup_steps
     )
+    
+    # Create cosine decay scheduler
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_decay_steps,
+        eta_min=args.learning_rate * args.min_lr_ratio  # End at specified ratio of target LR
+    )
+    
+    # Combine schedulers
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_steps]
+    )
+    
+    print(f"Learning rate schedule:")
+    print(f"  - Warmup steps: {args.warmup_steps}")
+    print(f"  - Cosine decay steps: {cosine_decay_steps}")
+    print(f"  - Total steps: {total_steps}")
+    print(f"  - Target LR: {args.learning_rate}")
+    print(f"  - Min LR: {args.learning_rate * args.min_lr_ratio} (ratio: {args.min_lr_ratio})")
+    
+    # Log hyperparameters to TensorBoard after all variables are defined
+    if tb_writer:
+        hparams_dict = {
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'weight_decay': args.weight_decay,
+            'resolution': args.resolution,
+            'max_num_tris': args.max_num_tris,
+            'precision': args.precision,
+            'loss_type': args.loss_type,
+            'grad_clip': args.grad_clip,
+            'epochs': args.epochs,
+            'warmup_steps': args.warmup_steps,
+            'cosine_decay_steps': cosine_decay_steps,
+            'min_lr_ratio': args.min_lr_ratio
+        }
+        tb_writer.add_hparams(hparams_dict, {'hparam/train_loss': 0.0})
 
      # Resume from checkpoint if specified
     start_epoch = 0
@@ -741,15 +786,15 @@ def main():
         os.path.join(args.output_dir, "final_model")
     )
     
-    # # Log training completion
-    # with open(log_file, 'a') as f:
-    #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    #     f.write("\n" + "=" * 50 + "\n")
-    #     f.write(f"[{timestamp}] Training completed!\n")
-    #     f.write(f"Final training loss: {train_loss:.6f}\n")
-    #     if val_loss is not None:
-    #         f.write(f"Final validation loss: {val_loss:.6f}\n")
-    #     f.write("=" * 50 + "\n")
+    # Log training completion
+    with open(log_file, 'a') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write("\n" + "=" * 50 + "\n")
+        f.write(f"[{timestamp}] Training completed!\n")
+        f.write(f"Final training loss: {train_loss:.6f}\n")
+        if val_loss is not None:
+            f.write(f"Final validation loss: {val_loss:.6f}\n")
+        f.write("=" * 50 + "\n")
     
     print("Training completed!")
     
@@ -759,7 +804,22 @@ def main():
         final_metrics = {'hparam/train_loss': train_loss}
         if val_loss is not None:
             final_metrics['hparam/val_loss'] = val_loss
-        tb_writer.add_hparams(hparams_dict, final_metrics)
+        
+        # Use the same hparams_dict from earlier
+        final_hparams_dict = {
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'weight_decay': args.weight_decay,
+            'resolution': args.resolution,
+            'max_num_tris': args.max_num_tris,
+            'precision': args.precision,
+            'loss_type': args.loss_type,
+            'grad_clip': args.grad_clip,
+            'epochs': args.epochs,
+            'warmup_steps': args.warmup_steps,
+            'min_lr_ratio': args.min_lr_ratio
+        }
+        tb_writer.add_hparams(final_hparams_dict, final_metrics)
         
         tb_writer.close()
         print(f"TensorBoard logs saved to: {tb_log_dir}")
