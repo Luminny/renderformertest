@@ -47,6 +47,7 @@ class RenderFormerDataset(Dataset):
         self.resolution = resolution
         self.max_num_tris = max_num_tris
         self.h5_files = list(self.data_dir.glob("*/*.h5"))
+        # self.h5_files = list(self.data_dir.glob("*.h5"))
         
         if len(self.h5_files) == 0:
             raise ValueError(f"No H5 files found in {data_dir}")
@@ -107,7 +108,8 @@ class RenderFormerDataset(Dataset):
             # Exact size, no padding needed
             mask = torch.ones(self.max_num_tris, dtype=torch.bool)
 
-        gt_images_exr_file = str(h5_file).replace('.h5', '.exr')
+        # gt_images_exr_file = str(h5_file).replace('.h5', '.exr')
+        gt_images_exr_file = str(h5_file).replace('.h5', '_normal_depth.exr')
         gt_images = torch.from_numpy(
             imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
         ).unsqueeze(0)
@@ -269,11 +271,11 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             total_loss += loss.item()
             num_batches += 1
             
-            # Log batch loss to file
-            if log_file:
-                with open(log_file, 'a') as f:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"[{timestamp}] Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {scheduler.get_last_lr()[0]:.2e}\n")
+            # # Log batch loss to file
+            # if log_file:
+            #     with open(log_file, 'a') as f:
+            #         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            #         f.write(f"[{timestamp}] Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {scheduler.get_last_lr()[0]:.2e}\n")
             
             # Log to TensorBoard
             if tb_writer:
@@ -419,7 +421,7 @@ def load_training_state(optimizer, scheduler, checkpoint_path):
         
         # 恢复优化器和调度器状态
         optimizer.load_state_dict(training_state['optimizer_state_dict'])
-        scheduler.load_state_dict(training_state['scheduler_state_dict'])
+        # scheduler.load_state_dict(training_state['scheduler_state_dict'])
         
         print(f"Resuming from epoch {training_state['epoch']} "
               f"with loss {training_state['loss']}")
@@ -490,6 +492,8 @@ def main():
                        help="W&B run name")
     parser.add_argument("--use_tensorboard", action="store_true", 
                        help="Use TensorBoard for logging")
+    parser.add_argument("--log_dir", type=str, default="./logs", 
+                       help="Output directory for logs")
     
     args = parser.parse_args()
     
@@ -512,14 +516,14 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Setup logging file
-    log_file = os.path.join(args.output_dir, "training_log.txt")
-    with open(log_file, 'w') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"Training Log - Started at {timestamp}\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"Arguments: {vars(args)}\n")
-        f.write("=" * 50 + "\n")
+    # # Setup logging file
+    # log_file = os.path.join(args.output_dir, "training_log.txt")
+    # with open(log_file, 'w') as f:
+    #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    #     f.write(f"Training Log - Started at {timestamp}\n")
+    #     f.write("=" * 50 + "\n")
+    #     f.write(f"Arguments: {vars(args)}\n")
+    #     f.write("=" * 50 + "\n")
     
     # Initialize wandb if requested
     if args.use_wandb:
@@ -532,12 +536,12 @@ def main():
     # Initialize TensorBoard if requested
     tb_writer = None
     if args.use_tensorboard:
-        tb_log_dir = os.path.join(args.output_dir, 
+        tb_log_dir = os.path.join(args.log_dir, 
                                  f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(tb_log_dir, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         print(f"TensorBoard logs will be saved to: {tb_log_dir}")
-        print(f"Run 'tensorboard --logdir {args.output_dir}' to view logs")
+        print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
         
         # Log hyperparameters to TensorBoard
         hparams_dict = {
@@ -623,7 +627,7 @@ def main():
     scheduler = CosineAnnealingLR(
         optimizer, 
         T_max=args.epochs,
-        eta_min=args.learning_rate * 0.01
+        eta_min=args.learning_rate * 0.1
     )
 
      # Resume from checkpoint if specified
@@ -651,14 +655,14 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         
-        # Log epoch start
-        with open(log_file, 'a') as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"\n[{timestamp}] Epoch {epoch+1}/{args.epochs}\n")
-            f.write("-" * 30 + "\n")
+        # # Log epoch start
+        # with open(log_file, 'a') as f:
+        #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        #     f.write(f"\n[{timestamp}] Epoch {epoch+1}/{args.epochs}\n")
+        #     f.write("-" * 30 + "\n")
         
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, log_file, tb_writer, epoch)
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, None, tb_writer, epoch)
         print(f"Training loss: {train_loss:.6f}")
         
         # Log epoch training loss to TensorBoard
@@ -671,18 +675,18 @@ def main():
                 tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Mean', stats['mean'], epoch)
                 tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Max', stats['max'], epoch)
         
-        # Log epoch training loss and gradient statistics
-        with open(log_file, 'a') as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"[{timestamp}] Epoch {epoch+1} Training Loss: {train_loss:.6f}\n")
+        # # Log epoch training loss and gradient statistics
+        # with open(log_file, 'a') as f:
+        #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        #     f.write(f"[{timestamp}] Epoch {epoch+1} Training Loss: {train_loss:.6f}\n")
             
-            # Log gradient statistics to file
-            if tb_writer:  # Only log if TensorBoard is enabled
-                gradient_stats = compute_gradient_stats_by_module(pipeline.model)
-                f.write(f"[{timestamp}] Gradient Statistics:\n")
-                for module_name, stats in gradient_stats.items():
-                    f.write(f"  {module_name}: mean={stats['mean']:.2e}, max={stats['max']:.2e}\n")
-                f.write("\n")
+        #     # Log gradient statistics to file
+        #     if tb_writer:  # Only log if TensorBoard is enabled
+        #         gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+        #         f.write(f"[{timestamp}] Gradient Statistics:\n")
+        #         for module_name, stats in gradient_stats.items():
+        #             f.write(f"  {module_name}: mean={stats['mean']:.2e}, max={stats['max']:.2e}\n")
+        #         f.write("\n")
         
         # Validate
         val_loss = None
@@ -690,10 +694,10 @@ def main():
             val_loss = validate(pipeline, val_dataloader, device, args)
             print(f"Validation loss: {val_loss:.6f}")
             
-            # Log epoch validation loss
-            with open(log_file, 'a') as f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"[{timestamp}] Epoch {epoch+1} Validation Loss: {val_loss:.6f}\n")
+            # # Log epoch validation loss
+            # with open(log_file, 'a') as f:
+            #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            #     f.write(f"[{timestamp}] Epoch {epoch+1} Validation Loss: {val_loss:.6f}\n")
             
             # Log to TensorBoard
             if tb_writer:
@@ -710,9 +714,9 @@ def main():
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                with open(log_file, 'a') as f:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"[{timestamp}] New best model saved! Validation loss: {val_loss:.6f}\n")
+                # with open(log_file, 'a') as f:
+                #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                #     f.write(f"[{timestamp}] New best model saved! Validation loss: {val_loss:.6f}\n")
                 save_checkpoint(
                     pipeline, optimizer, scheduler, epoch, val_loss,
                     os.path.join(args.output_dir, "best_model")
@@ -737,15 +741,15 @@ def main():
         os.path.join(args.output_dir, "final_model")
     )
     
-    # Log training completion
-    with open(log_file, 'a') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write("\n" + "=" * 50 + "\n")
-        f.write(f"[{timestamp}] Training completed!\n")
-        f.write(f"Final training loss: {train_loss:.6f}\n")
-        if val_loss is not None:
-            f.write(f"Final validation loss: {val_loss:.6f}\n")
-        f.write("=" * 50 + "\n")
+    # # Log training completion
+    # with open(log_file, 'a') as f:
+    #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    #     f.write("\n" + "=" * 50 + "\n")
+    #     f.write(f"[{timestamp}] Training completed!\n")
+    #     f.write(f"Final training loss: {train_loss:.6f}\n")
+    #     if val_loss is not None:
+    #         f.write(f"Final validation loss: {val_loss:.6f}\n")
+    #     f.write("=" * 50 + "\n")
     
     print("Training completed!")
     
