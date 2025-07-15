@@ -110,6 +110,7 @@ class RenderFormerDataset(Dataset):
 
         # gt_images_exr_file = str(h5_file).replace('.h5', '.exr')
         gt_images_exr_file = str(h5_file).replace('.h5', '_normal_depth.exr')
+        # gt_images_exr_file = str(h5_file).replace('.h5', '_lighting.exr')
         gt_images = torch.from_numpy(
             imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
         ).unsqueeze(0)
@@ -436,6 +437,47 @@ def load_training_state(optimizer, scheduler, checkpoint_path):
         return optimizer, scheduler, 0, float('inf')
 
 
+def load_epoch_from_training_state(checkpoint_path):
+    """Load model checkpoint from Hugging Face format"""
+    # 加载训练状态
+    training_state_path = os.path.join(checkpoint_path, 'training_state.pt')
+    if os.path.exists(training_state_path):
+        training_state = torch.load(training_state_path, map_location='cpu')
+        print(f"Resuming from epoch {training_state['epoch']} "
+              f"with loss {training_state['loss']}")
+        
+        return training_state['epoch']
+    else:
+        return 0
+    
+
+def load_optimizer_state(optimizer, checkpoint_path, update_lr=1e-4):
+    """Load optimizer state from checkpoint"""
+    # 加载训练状态
+    training_state_path = os.path.join(checkpoint_path, 'training_state.pt')
+    if os.path.exists(training_state_path):
+        training_state = torch.load(training_state_path, map_location='cpu')
+        
+        # 恢复优化器和调度器状态
+        optimizer.load_state_dict(training_state['optimizer_state_dict'])
+
+        for param_group in optimizer.param_groups:
+            param_group['initial_lr'] = update_lr
+
+        # print(optimizer.param_groups)
+        
+        print(f"Resuming from optimizer state")
+
+        # print optimizer state
+        # print(f"Optimizer state: {optimizer.state_dict()}")
+        
+        return optimizer
+    else:
+        print(f"No training state found at {training_state_path}")
+        # print(f"Optimizer state: {optimizer.state_dict()}")
+        return optimizer
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train RenderFormer model")
     
@@ -618,6 +660,8 @@ def main():
         lr=args.learning_rate, 
         weight_decay=args.weight_decay
     )
+    if args.resume_from:
+        optimizer = load_optimizer_state(optimizer, args.resume_from, args.learning_rate)
     
     # Calculate total training steps
     total_steps = len(train_dataloader) * args.epochs
@@ -649,6 +693,9 @@ def main():
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[args.warmup_steps]
     )
+
+    # print scheduler state
+    print(f"Scheduler state: {scheduler.state_dict()}")
     
     print(f"Learning rate schedule:")
     print(f"  - Warmup steps: {args.warmup_steps}")
@@ -679,7 +726,7 @@ def main():
     start_epoch = 0
     best_val_loss = float('inf')
     if args.resume_from:
-        optimizer, scheduler, start_epoch, best_val_loss = load_training_state(optimizer, scheduler, args.resume_from)
+        start_epoch = load_epoch_from_training_state(args.resume_from)
         print(f"Resuming training from epoch {start_epoch}")
     
     # Print gradient monitoring info
