@@ -35,6 +35,32 @@ class GeoRasterRenderingPipeline:
         self.ray_generator.to(device)
         return self
 
+    def render_data(
+        self, 
+        data, 
+        resolution: int = 512, 
+        torch_dtype: torch.dtype = torch.float16, 
+        device: torch.device = None
+        ):
+        
+        triangles = data['triangles'].to(device)
+        mask = data['mask'].to(device)
+        vn = data['vn'].to(device)
+        c2w = data['c2w'].to(device)
+        fov = data['fov'].to(device)
+
+        rendered_imgs = self.render(
+            triangles=triangles,
+            mask=mask,
+            vn=vn,
+            c2w=c2w,
+            fov=fov,
+            resolution=resolution,
+            torch_dtype=torch_dtype,
+        )
+
+        return rendered_imgs
+
     def render(
         self,
         triangles,
@@ -119,4 +145,4 @@ class GeoRasterRenderingPipeline:
         return rendered_imgs
 
     def __call__(self, *args, **kwargs):
-        return self.render(*args, **kwargs)
+        return self.render_data(*args, **kwargs)

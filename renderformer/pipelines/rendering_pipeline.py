@@ -17,13 +17,55 @@ class RenderFormerRenderingPipeline:
         model.eval()
         return cls(model)
 
+    def _get_model_device(self):
+        """Get device from model, handling DataParallel wrapper"""
+        if hasattr(self.model, 'module'):
+            # DataParallel wrapped model
+            return next(self.model.module.parameters()).device
+        else:
+            # Regular model
+            return next(self.model.parameters()).device
+
     @property
     def device(self):
-        return self.model.device
+        return self._get_model_device()
+        
+    # @property
+    # def device(self):
+    #     return self.model.device
 
     def to(self, device: torch.device):
         self.model.to(device)
         self.ray_generator.to(device)
+
+    def render_data(
+        self, 
+        data, 
+        resolution: int = 512, 
+        torch_dtype: torch.dtype = torch.float16, 
+        device: torch.device = None
+        ):
+        
+        triangles = data['triangles'].to(device)
+        texture = data['texture'].to(device)
+        mask = data['mask'].to(device)
+        vn = data['vn'].to(device)
+        c2w = data['c2w'].to(device)
+        fov = data['fov'].to(device)
+
+        rendered_imgs = self.render(
+            triangles=triangles,
+            texture=texture,
+            mask=mask,
+            vn=vn,
+            c2w=c2w,
+            fov=fov,
+            resolution=resolution,
+            torch_dtype=torch_dtype,
+        )
+
+        return rendered_imgs
+        
 
     def render(
         self,
@@ -126,4 +168,4 @@ class RenderFormerRenderingPipeline:
         return rendered_imgs
 
     def __call__(self, *args, **kwargs):
-        return self.render(*args, **kwargs)
+        return self.render_data(*args, **kwargs)

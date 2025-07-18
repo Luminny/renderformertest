@@ -35,6 +35,7 @@ from pathlib import Path
 import imageio
 from datetime import datetime
 import lpips
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from renderformer import GeoRasterRenderingPipeline
 from renderformer.models.config import RenderFormerConfig
@@ -257,15 +258,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, scaler=
                                   config.loss_type)
                 # loss = compute_loss(rendered_imgs, gt_images, 
                 #                   config.loss_type)
-
-                
-                # print(f"rendered_imgs: {rendered_imgs.dtype}")
-                # print(f"gt_images: {gt_images.dtype}")
-                # print(f"loss: {loss.dtype}")
-
-                # # print model parameters dtype
-                # for name, param in model.model.named_parameters():
-                #     print(f"{name}: {param.dtype}")
                 
                 # Handle multi-GPU training - convert tensor loss to scalar
                 if hasattr(loss, 'mean'):
@@ -303,12 +295,6 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, scaler=
             
             total_loss += loss.item()
             num_batches += 1
-            
-            # # Log batch loss to file
-            # if log_file:
-            #     with open(log_file, 'a') as f:
-            #         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            #         f.write(f"[{timestamp}] Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {scheduler.get_last_lr()[0]:.2e}\n")
             
             # Log to TensorBoard
             if tb_writer:
@@ -784,12 +770,6 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         
-        # # Log epoch start
-        # with open(log_file, 'a') as f:
-        #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        #     f.write(f"\n[{timestamp}] Epoch {epoch+1}/{args.epochs}\n")
-        #     f.write("-" * 30 + "\n")
-        
         # Train
         train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, tb_writer, epoch)
         print(f"Training loss: {train_loss:.6f}")
@@ -804,29 +784,11 @@ def main():
                 tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Mean', stats['mean'], epoch)
                 tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Max', stats['max'], epoch)
         
-        # # Log epoch training loss and gradient statistics
-        # with open(log_file, 'a') as f:
-        #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        #     f.write(f"[{timestamp}] Epoch {epoch+1} Training Loss: {train_loss:.6f}\n")
-            
-        #     # Log gradient statistics to file
-        #     if tb_writer:  # Only log if TensorBoard is enabled
-        #         gradient_stats = compute_gradient_stats_by_module(pipeline.model)
-        #         f.write(f"[{timestamp}] Gradient Statistics:\n")
-        #         for module_name, stats in gradient_stats.items():
-        #             f.write(f"  {module_name}: mean={stats['mean']:.2e}, max={stats['max']:.2e}\n")
-        #         f.write("\n")
-        
         # Validate
         val_loss = None
         if val_dataloader is not None:
             val_loss = validate(pipeline, val_dataloader, device, args)
             print(f"Validation loss: {val_loss:.6f}")
-            
-            # # Log epoch validation loss
-            # with open(log_file, 'a') as f:
-            #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            #     f.write(f"[{timestamp}] Epoch {epoch+1} Validation Loss: {val_loss:.6f}\n")
             
             # Log to TensorBoard
             if tb_writer:
@@ -843,9 +805,6 @@ def main():
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                # with open(log_file, 'a') as f:
-                #     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                #     f.write(f"[{timestamp}] New best model saved! Validation loss: {val_loss:.6f}\n")
                 save_checkpoint(
                     pipeline, optimizer, scheduler, epoch, val_loss,
                     os.path.join(args.output_dir, "best_model")
