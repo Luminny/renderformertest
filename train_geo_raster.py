@@ -198,6 +198,8 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
         return F.l1_loss(pred_images, gt_images)
     elif loss_type == 'l2':
         return F.mse_loss(pred_images, gt_images)
+    elif loss_type == 'l1_w_l2':
+        return F.l1_loss(pred_images, gt_images) + F.mse_loss(pred_images, gt_images)
     elif loss_type == 'smooth_l1':
         return F.smooth_l1_loss(pred_images, gt_images)
     elif loss_type == 'lpips_alex':
@@ -210,7 +212,7 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_file=None, tb_writer=None, epoch=0):
+def train_epoch(model, dataloader, optimizer, scheduler, device, config, scaler=None, tb_writer=None, epoch=0):
     """Train for one epoch"""
     model.model.train()
     total_loss = 0.0
@@ -249,8 +251,22 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             
             # Compute loss if ground truth is available
             if gt_images is not None:
-                loss = compute_loss(rendered_imgs, gt_images, 
+                # print rendered_imgs dtype
+                
+                loss = compute_loss(rendered_imgs, gt_images.to(torch.float16), 
                                   config.loss_type)
+                # loss = compute_loss(rendered_imgs, gt_images, 
+                #                   config.loss_type)
+
+                
+                # print(f"rendered_imgs: {rendered_imgs.dtype}")
+                # print(f"gt_images: {gt_images.dtype}")
+                # print(f"loss: {loss.dtype}")
+
+                # # print model parameters dtype
+                # for name, param in model.model.named_parameters():
+                #     print(f"{name}: {param.dtype}")
+                
                 # Handle multi-GPU training - convert tensor loss to scalar
                 if hasattr(loss, 'mean'):
                     loss = loss.mean()
@@ -259,15 +275,28 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
             
             optimizer.zero_grad()
             
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            if config.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), 
-                                             config.grad_clip)
-            
-            optimizer.step()
+            # Backward pass with GradScaler if available
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                
+                # Gradient clipping with scaler
+                if config.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.model.parameters(), 
+                                                 config.grad_clip)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Traditional backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                if config.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.model.parameters(), 
+                                                 config.grad_clip)
+                
+                optimizer.step()
             
             # Step scheduler every batch for warmup + cosine decay
             scheduler.step()
@@ -288,14 +317,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, log_fil
                 tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
                 
                 # Log gradient norms by module every 100 steps
-                if global_step % 50 == 1:
+                if global_step % 100 == 1:
                     gradient_stats = compute_gradient_stats_by_module(model.model)
                     for module_name, stats in gradient_stats.items():
                         tb_writer.add_scalar(f'Gradients/{module_name}/Mean', stats['mean'], global_step)
                         tb_writer.add_scalar(f'Gradients/{module_name}/Max', stats['max'], global_step)
                 
                 # Log sample images every 500 steps
-                if global_step % 50 == 0 and gt_images is not None:
+                if global_step % 25 == 0 and gt_images is not None:
                     # Take first image from batch for visualization
                     pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
                     gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
@@ -515,9 +544,9 @@ def main():
                        help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, 
                        help="Weight decay")
-    parser.add_argument("--grad_clip", type=float, default=1.0, 
+    parser.add_argument("--grad_clip", type=float, default=0, 
                        help="Gradient clipping value")
-    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'smooth_l1', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex'], 
+    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'l1_w_l2', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex'], 
                        default='l1', help="Loss function type")
     parser.add_argument("--warmup_steps", type=int, default=8000, 
                        help="Number of warmup steps for learning rate")
@@ -567,15 +596,6 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Setup logging file
-    log_file = os.path.join(args.output_dir, "training_log.txt")
-    with open(log_file, 'w') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"Training Log - Started at {timestamp}\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"Arguments: {vars(args)}\n")
-        f.write("=" * 50 + "\n")
-    
     # Initialize wandb if requested
     if args.use_wandb:
         wandb.init(
@@ -586,6 +606,7 @@ def main():
     
     # Initialize TensorBoard if requested
     tb_writer = None
+    tb_log_dir = None
     if args.use_tensorboard:
         tb_log_dir = os.path.join(args.log_dir, 
                                  f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -593,6 +614,18 @@ def main():
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         print(f"TensorBoard logs will be saved to: {tb_log_dir}")
         print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
+
+    # Setup logging file
+    log_file = os.path.join(args.output_dir, "training_log.txt")
+    with open(log_file, 'w') as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.write(f"Training Log - Started at {timestamp}\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Arguments: {vars(args)}\n")
+        f.write("=" * 50 + "\n")
+        # write tb_log_dir
+        f.write(f"TensorBoard logs will be saved to: {tb_log_dir}\n")
+        f.write("Run 'tensorboard --logdir {args.log_dir}' to view logs\n")
     
     # Init model
     if args.resume_from:
@@ -697,6 +730,10 @@ def main():
     # print scheduler state
     print(f"Scheduler state: {scheduler.state_dict()}")
     
+    # Initialize GradScaler for mixed precision training
+    scaler = torch.amp.GradScaler()
+    print(f"GradScaler initialized for {args.precision} mixed precision training")
+    
     print(f"Learning rate schedule:")
     print(f"  - Warmup steps: {args.warmup_steps}")
     print(f"  - Cosine decay steps: {cosine_decay_steps}")
@@ -754,7 +791,7 @@ def main():
         #     f.write("-" * 30 + "\n")
         
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, None, tb_writer, epoch)
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, tb_writer, epoch)
         print(f"Training loss: {train_loss:.6f}")
         
         # Log epoch training loss to TensorBoard
