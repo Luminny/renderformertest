@@ -5,6 +5,8 @@ import numpy as np
 from torch.utils.data import Dataset
 from pathlib import Path
 import imageio
+import random
+import logging
 
 class RenderFormerDataset(Dataset):
     def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline"):
@@ -20,11 +22,47 @@ class RenderFormerDataset(Dataset):
             raise ValueError(f"No H5 files found in {data_dir}")
         
         print(f"Found {len(self.h5_files)} H5 files in {data_dir}")
+        
+        # Setup logging for file errors
+        self.logger = logging.getLogger(f"RenderFormerDataset_{id(self)}")
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.WARNING)
     
     def __len__(self):
         return len(self.h5_files)
     
-    def __getitem__(self, idx):
+    def _load_data_with_retry(self, idx, max_retries=5):
+        """
+        Try to load data from file with error handling and retry mechanism
+        """
+        for attempt in range(max_retries):
+            try:
+                return self._load_single_file(idx)
+            except Exception as e:
+                h5_file = self.h5_files[idx]
+                error_msg = f"Error loading file {h5_file}: {type(e).__name__}: {str(e)}"
+                self.logger.error(error_msg)
+                print(f"[FILE ERROR] {error_msg}")
+                
+                if attempt < max_retries - 1:
+                    # Try a random different file for next attempt
+                    idx = random.randint(0, len(self.h5_files) - 1)
+                    print(f"[RETRY] Attempting to load different file (attempt {attempt + 2}/{max_retries}): {self.h5_files[idx]}")
+                else:
+                    print(f"[CRITICAL] Failed to load any file after {max_retries} attempts")
+                    raise e
+        
+        # This should never be reached, but just in case
+        raise RuntimeError(f"Failed to load data after {max_retries} attempts")
+    
+    def _load_single_file(self, idx):
+        """
+        Load data from a single file (without retry logic)
+        """
         h5_file = self.h5_files[idx]
         
         # triangles: [num_tris, 3, 3]
@@ -35,18 +73,21 @@ class RenderFormerDataset(Dataset):
         # gt_img: [num_views, H, W, 3]
         # todo: num_views is not always 1, need to handle this
         
-        with h5py.File(h5_file, 'r') as f:
-            triangles = torch.from_numpy(
-                np.array(f['triangles']).astype(np.float32)
-            )
-            num_tris = triangles.shape[0]
-            vn = torch.from_numpy(np.array(f['vn']).astype(np.float32))
-            c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
-            fov = torch.from_numpy(
-                np.array(f['fov']).astype(np.float32)
-            ).unsqueeze(0)
-            if self.need_texture:
-                texture = torch.from_numpy(np.array(f['texture'])).float()
+        try:
+            with h5py.File(h5_file, 'r') as f:
+                triangles = torch.from_numpy(
+                    np.array(f['triangles']).astype(np.float32)
+                )
+                num_tris = triangles.shape[0]
+                vn = torch.from_numpy(np.array(f['vn']).astype(np.float32))
+                c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
+                fov = torch.from_numpy(
+                    np.array(f['fov']).astype(np.float32)
+                ).unsqueeze(0)
+                if self.need_texture:
+                    texture = torch.from_numpy(np.array(f['texture'])).float()
+        except Exception as e:
+            raise Exception(f"Failed to read H5 file {h5_file}: {type(e).__name__}: {str(e)}")
 
         # Pad triangles to max_num_tris
         if num_tris < self.max_num_tris:
@@ -82,10 +123,14 @@ class RenderFormerDataset(Dataset):
             # Exact size, no padding needed
             mask = torch.ones(self.max_num_tris, dtype=torch.bool)
 
+        # Load ground truth images
         gt_images_exr_file = str(h5_file).replace('.h5', self.exr_file_path)
-        gt_images = torch.from_numpy(
-            imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
-        ).unsqueeze(0)
+        try:
+            gt_images = torch.from_numpy(
+                imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
+            ).unsqueeze(0)
+        except Exception as e:
+            raise Exception(f"Failed to read EXR file {gt_images_exr_file}: {type(e).__name__}: {str(e)}")
 
         if self.pipeline_type == "GeoRasterRenderingPipeline":
             data = {
@@ -111,3 +156,6 @@ class RenderFormerDataset(Dataset):
         else:
             raise ValueError(f"Invalid pipeline type: {self.pipeline_type}")
         return data
+
+    def __getitem__(self, idx):
+        return self._load_data_with_retry(idx)

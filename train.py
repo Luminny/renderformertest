@@ -4,7 +4,7 @@ RenderFormer Training Script with TensorBoard and Wandb Support
 This script provides comprehensive training for RenderFormer models with:
 - TensorBoard visualization for loss curves, gradients, and sample images
 - Wandb integration for experiment tracking
-- Multi-GPU support with DataParallel
+- Multi-GPU support with DistributedDataParallel
 - Flexible loss functions (L1, L2, LPIPS)
 - Checkpoint saving and resuming
 
@@ -17,6 +17,9 @@ Usage:
     
     # Training with both TensorBoard and Wandb
     python train_geo_raster.py --train_data_dir /path/to/data --use_tensorboard --use_wandb
+    
+    # Distributed training with multiple GPUs
+    torchrun --nproc_per_node=8 train.py --train_data_dir /path/to/data --use_tensorboard
 """
 
 import os
@@ -25,6 +28,7 @@ import h5py
 import argparse
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
@@ -33,6 +37,7 @@ from tqdm import tqdm
 import wandb
 from datetime import datetime
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 from renderformer import GeoRasterRenderingPipeline, RenderFormerRenderingPipeline
 from renderformer.models.config import RenderFormerConfig
@@ -43,13 +48,47 @@ from train_loss import compute_loss, loss_fn_alex
 from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state
 from train_datasets import RenderFormerDataset
 
-def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scaler=None, tb_writer=None, epoch=0):
+
+def setup_distributed():
+    """Initialize distributed training"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        print("Not using distributed training")
+        return False, 0, 1, 0
+    
+    # Initialize the process group
+    dist.init_process_group(backend='nccl', init_method='env://')
+    
+    # Set the device for this process
+    torch.cuda.set_device(local_rank)
+    
+    print(f"Rank {rank}/{world_size}, Local rank {local_rank}")
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    """Clean up distributed training"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scaler=None, tb_writer=None, epoch=0, rank=0):
     """Train for one epoch"""
     pipeline.model.train()
     total_loss = 0.0
     num_batches = 0
+
+    if isinstance(dataloader.sampler, DistributedSampler):
+        dataloader.sampler.set_epoch(epoch)
     
-    progress_bar = tqdm(dataloader, desc="Training")
+    # Only show progress bar on rank 0
+    if rank == 0:
+        progress_bar = tqdm(dataloader, desc="Training")
+    else:
+        progress_bar = dataloader
     
     for batch_idx, data in enumerate(progress_bar):
         # Move data to device
@@ -69,6 +108,7 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                 data=data,
                 resolution=config.resolution,
                 torch_dtype=torch_dtype,
+                device=device,
             )
             
             # Compute loss if ground truth is available
@@ -141,11 +181,12 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                     
                     tb_writer.add_image('Images/Prediction_Ground_Truth', concat_img, global_step)
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.6f}',
-                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
-            })
+            # Update progress bar (only on rank 0)
+            if rank == 0:
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.6f}',
+                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                })
             
             # Log to wandb
             if config.use_wandb:
@@ -169,14 +210,19 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
     return avg_loss
 
 
-def validate(model, dataloader, device, config):
+def validate(model, dataloader, device, config, rank=0):
     """Validate the model"""
     model.model.eval()
     total_loss = 0.0
     num_batches = 0
     
     with torch.no_grad():
-        for data in tqdm(dataloader, desc="Validation"):
+        if rank == 0:
+            data_iter = tqdm(dataloader, desc="Validation")
+        else:
+            data_iter = dataloader
+        
+        for data in data_iter:
             # Move data to device
             triangles = data['triangles'].to(device)
             texture = data['texture'].to(device)
@@ -274,8 +320,8 @@ def main():
                        help="Number of steps for cosine decay (if None, use total training steps)")
     parser.add_argument("--min_lr_ratio", type=float, default=0.01, 
                        help="Minimum learning rate as ratio of target LR (default: 0.01 = 1%)")
-    parser.add_argument("--no_data_parallel", action="store_true", 
-                       help="Disable DataParallel for multi-GPU training")
+    parser.add_argument("--no_distributed", action="store_true", 
+                       help="Disable distributed training even if multiple GPUs are available")
     
     # Output arguments
     parser.add_argument("--output_dir", type=str, default="./checkpoints", 
@@ -297,6 +343,24 @@ def main():
     
     args = parser.parse_args()
 
+    # Setup distributed training
+    is_distributed, rank, world_size, local_rank = setup_distributed()
+    
+    # Setup device
+    if torch.cuda.is_available():
+        if is_distributed:
+            device = torch.device(f'cuda:{local_rank}')
+            print(f"Rank {rank}: Using GPU {local_rank}")
+        else:
+            device = torch.device('cuda')
+            num_gpus = torch.cuda.device_count()
+            if rank == 0:
+                print(f"Using {num_gpus} GPU(s) in single-process mode")
+    else:
+        device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
+        if rank == 0:
+            print(f"Using device: {device}")
+
     PIPELINE_CLASS = None
     MODEL_CLASS = None
     if args.pipeline_type == "GeoRasterRenderingPipeline":
@@ -308,37 +372,22 @@ def main():
     else:
         raise ValueError(f"Invalid pipeline type: {args.pipeline_type}")
     
-    # Setup device
-    if torch.cuda.is_available():
-        device = torch.device('cuda')
-        num_gpus = torch.cuda.device_count()
-        print(f"Using {num_gpus} GPU(s): {device}")
-        if num_gpus > 1:
-            print(f"Multi-GPU training will be enabled with DataParallel")
-            # Adjust batch size for multi-GPU training
-            if args.batch_size % num_gpus != 0:
-                print(f"Warning: batch_size ({args.batch_size}) is not divisible by num_gpus ({num_gpus})")
-                print(f"Consider using a batch size that's divisible by {num_gpus} for optimal performance")
-    else:
-        device = torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
-        num_gpus = 1
-        print(f"Using device: {device}")
+    # Create output directory (only on rank 0)
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Initialize wandb if requested
-    if args.use_wandb:
+    # Initialize wandb if requested (only on rank 0)
+    if args.use_wandb and rank == 0:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=vars(args)
         )
     
-    # Initialize TensorBoard if requested
+    # Initialize TensorBoard if requested (only on rank 0)
     tb_writer = None
     tb_log_dir = None
-    if args.use_tensorboard:
+    if args.use_tensorboard and rank == 0:
         tb_log_dir = os.path.join(args.log_dir, 
                                  f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         os.makedirs(tb_log_dir, exist_ok=True)
@@ -346,73 +395,112 @@ def main():
         print(f"TensorBoard logs will be saved to: {tb_log_dir}")
         print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
 
-    # Setup logging file
+    # Setup logging file (only on rank 0)
     log_file = os.path.join(args.output_dir, "training_log.txt")
-    with open(log_file, 'w') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"Training Log - Started at {timestamp}\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"Arguments: {vars(args)}\n")
-        f.write("=" * 50 + "\n")
-        f.write(f"TensorBoard logs will be saved to: {tb_log_dir}\n")
-        f.write("=" * 50 + "\n")
+    if rank == 0:
+        with open(log_file, 'w') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"Training Log - Started at {timestamp}\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Arguments: {vars(args)}\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"TensorBoard logs will be saved to: {tb_log_dir}\n")
+            f.write("=" * 50 + "\n")
     
     # Init model
     if args.resume_from:
-        print(f"Loading checkpoint from {args.resume_from}...")
+        if rank == 0:
+            print(f"Loading checkpoint from {args.resume_from}...")
         pipeline = PIPELINE_CLASS.from_pretrained(args.resume_from)
     elif args.pretrain_from:
-        print(f"Loading pretrained model from {args.pretrain_from}...")
+        if rank == 0:
+            print(f"Loading pretrained model from {args.pretrain_from}...")
         pipeline = PIPELINE_CLASS.from_pretrained(args.pretrain_from)
     else:
-        print(f"Creating new {args.pipeline_type} model from scratch...")
+        if rank == 0:
+            print(f"Creating new {args.pipeline_type} model from scratch...")
         model_config = RenderFormerConfig.from_json(args.model_config)
         pipeline = PIPELINE_CLASS(MODEL_CLASS(model_config))
-        print("✓ New model created successfully")
+        if rank == 0:
+            print("✓ New model created successfully")
 
-    # Enable multi-GPU training with DataParallel
-    if torch.cuda.is_available() and num_gpus > 1 and not args.no_data_parallel:
-        pipeline.model = torch.nn.DataParallel(pipeline.model)
-        print(f"Model wrapped with DataParallel for {num_gpus} GPUs")
-    elif torch.cuda.is_available() and num_gpus > 1 and args.no_data_parallel:
-        print(f"DataParallel disabled by --no_data_parallel flag, using single GPU")
-
-    
     # Apply optimizations
+    # if False and device.type == 'cuda' and os.name == 'posix':  # avoid windows
     if device.type == 'cuda' and os.name == 'posix':  # avoid windows
         try:
             from renderformer_liger_kernel import apply_kernels
             apply_kernels(pipeline.model)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            print("Applied liger kernel optimizations")
+            if rank == 0:
+                print("Applied liger kernel optimizations")
         except ImportError:
-            print("Liger kernel not available, skipping optimizations")
+            if rank == 0:
+                print("Liger kernel not available, skipping optimizations")
     elif device.type == 'mps':
         args.precision = 'fp32'
-        print("bf16 and fp16 will cause too large error in MPS, "
-              "force using fp32 instead.")
+        if rank == 0:
+            print("bf16 and fp16 will cause too large error in MPS, "
+                  "force using fp32 instead.")
 
     pipeline.to(device)
     loss_fn_alex.to(device)
+
+    # Enable distributed training with DDP
+    if is_distributed and torch.cuda.is_available() and not args.no_distributed:
+        pipeline.model = DDP(pipeline.model, device_ids=[local_rank], output_device=local_rank)
+        if rank == 0:
+            print(f"Model wrapped with DistributedDataParallel for distributed training")
+    elif is_distributed and args.no_distributed:
+        if rank == 0:
+            print(f"Distributed training disabled by --no_distributed flag")
+
+    # pipeline.to(device)
+    # loss_fn_alex.to(device)
     
     # Create datasets and dataloaders
     train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris, args.pipeline_type)
+    
+    # Use DistributedSampler for distributed training
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        shuffle = False
+    else:
+        train_sampler = None
+        shuffle = True
+    
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
-        shuffle=True, 
+        shuffle=shuffle,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
     
     val_dataloader = None
+    val_sampler = None
     if args.val_data_dir:
         val_dataset = RenderFormerDataset(args.val_data_dir, args.resolution, args.max_num_tris, args.pipeline_type)
+        
+        if is_distributed:
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+            
         val_dataloader = DataLoader(
             val_dataset, 
             batch_size=args.batch_size, 
-            shuffle=False, 
+            shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=True
         )
@@ -457,29 +545,32 @@ def main():
         milestones=[args.warmup_steps]
     )
 
-    # print scheduler state
-    print(f"Scheduler state: {scheduler.state_dict()}")
+    # print scheduler state (only on rank 0)
+    if rank == 0:
+        print(f"Scheduler state: {scheduler.state_dict()}")
     
     # Initialize GradScaler for mixed precision training
     scaler = torch.amp.GradScaler()
-    print(f"GradScaler initialized for {args.precision} mixed precision training")
-    
-    print(f"Learning rate schedule:")
-    print(f"  - Warmup steps: {args.warmup_steps}")
-    print(f"  - Cosine decay steps: {cosine_decay_steps}")
-    print(f"  - Total steps: {total_steps}")
-    print(f"  - Target LR: {args.learning_rate}")
-    print(f"  - Min LR: {args.learning_rate * args.min_lr_ratio} (ratio: {args.min_lr_ratio})")
+    if rank == 0:
+        print(f"GradScaler initialized for {args.precision} mixed precision training")
+        
+        print(f"Learning rate schedule:")
+        print(f"  - Warmup steps: {args.warmup_steps}")
+        print(f"  - Cosine decay steps: {cosine_decay_steps}")
+        print(f"  - Total steps: {total_steps}")
+        print(f"  - Target LR: {args.learning_rate}")
+        print(f"  - Min LR: {args.learning_rate * args.min_lr_ratio} (ratio: {args.min_lr_ratio})")
     
 
     start_epoch = 0
     best_val_loss = float('inf')
     if args.resume_from:
         start_epoch = load_epoch_from_training_state(args.resume_from)
-        print(f"Resuming training from epoch {start_epoch}")
+        if rank == 0:
+            print(f"Resuming training from epoch {start_epoch}")
     
-    # Print gradient monitoring info
-    if args.use_tensorboard:
+    # Print gradient monitoring info (only on rank 0)
+    if args.use_tensorboard and rank == 0:
         print("\n" + "="*60)
         print("GRADIENT MONITORING ENABLED")
         print("="*60)
@@ -493,14 +584,20 @@ def main():
     
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        if rank == 0:
+            print(f"\nEpoch {epoch+1}/{args.epochs}")
+        
+        # Set epoch for distributed sampler
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, tb_writer, epoch)
-        print(f"Training loss: {train_loss:.6f}")
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, tb_writer, epoch, rank)
+        if rank == 0:
+            print(f"Training loss: {train_loss:.6f}")
         
-        # Log epoch training loss to TensorBoard
-        if tb_writer:
+        # Log epoch training loss to TensorBoard (only on rank 0)
+        if tb_writer and rank == 0:
             tb_writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
             
             # Log gradient statistics at epoch end
@@ -512,67 +609,73 @@ def main():
         # Validate
         val_loss = None
         if val_dataloader is not None:
-            val_loss = validate(pipeline, val_dataloader, device, args)
-            print(f"Validation loss: {val_loss:.6f}")
+            val_loss = validate(pipeline, val_dataloader, device, args, rank)
+            if rank == 0:
+                print(f"Validation loss: {val_loss:.6f}")
             
-            # Log to TensorBoard
-            if tb_writer:
+            # Log to TensorBoard (only on rank 0)
+            if tb_writer and rank == 0:
                 tb_writer.add_scalar('Loss/Validation_Epoch', val_loss, epoch)
             
-            # Log to wandb
-            if args.use_wandb:
+            # Log to wandb (only on rank 0)
+            if args.use_wandb and rank == 0:
                 wandb.log({
                     'epoch': epoch,
                     'train_loss': train_loss,
                     'val_loss': val_loss
                 })
             
-            # Save best model
-            if val_loss < best_val_loss:
+            # Save best model (only on rank 0)
+            if val_loss < best_val_loss and rank == 0:
                 best_val_loss = val_loss
                 save_checkpoint(
                     pipeline, optimizer, scheduler, epoch, val_loss,
                     os.path.join(args.output_dir, "best_model")
                 )
         else:
-            if args.use_wandb:
+            if args.use_wandb and rank == 0:
                 wandb.log({
                     'epoch': epoch,
                     'train_loss': train_loss
                 })
         
-        # Save checkpoint periodically
-        if (epoch + 1) % args.save_freq == 1:
+        # Save checkpoint periodically (only on rank 0)
+        if (epoch + 1) % args.save_freq == 1 and rank == 0:
             save_checkpoint(
                 pipeline, optimizer, scheduler, epoch, train_loss,
                 os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}")
             )
     
-    # Save final model
-    save_checkpoint(
-        pipeline, optimizer, scheduler, args.epochs-1, train_loss,
-        os.path.join(args.output_dir, "final_model")
-    )
+    # Save final model (only on rank 0)
+    if rank == 0:
+        save_checkpoint(
+            pipeline, optimizer, scheduler, args.epochs-1, train_loss,
+            os.path.join(args.output_dir, "final_model")
+        )
+        
+        # Log training completion
+        with open(log_file, 'a') as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write("\n" + "=" * 50 + "\n")
+            f.write(f"[{timestamp}] Training completed!\n")
+            f.write(f"Final training loss: {train_loss:.6f}\n")
+            if val_loss is not None:
+                f.write(f"Final validation loss: {val_loss:.6f}\n")
+            f.write("=" * 50 + "\n")
+        
+        print("Training completed!")
+        
+        # Close TensorBoard writer
+        if tb_writer:
+            tb_writer.close()
+            print(f"TensorBoard logs saved to: {tb_log_dir}")
+        
+        if args.use_wandb:
+            wandb.finish()
     
-    # Log training completion
-    with open(log_file, 'a') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write("\n" + "=" * 50 + "\n")
-        f.write(f"[{timestamp}] Training completed!\n")
-        f.write(f"Final training loss: {train_loss:.6f}\n")
-        if val_loss is not None:
-            f.write(f"Final validation loss: {val_loss:.6f}\n")
-        f.write("=" * 50 + "\n")
-    
-    print("Training completed!")
-    
-    # Close TensorBoard writer
-    if tb_writer:
-        tb_writer.close()
-        print(f"TensorBoard logs saved to: {tb_log_dir}")
-    
-    if args.use_wandb:
-        wandb.finish()
+    # Clean up distributed training
+    if is_distributed:
+        cleanup_distributed()
 
 
 if __name__ == '__main__':

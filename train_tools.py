@@ -11,7 +11,7 @@ def compute_gradient_stats_by_module(model):
     Returns:
         Dict containing gradient statistics for each module
     """
-    # Handle DataParallel wrapper
+    # Handle DataParallel/DistributedDataParallel wrapper
     if hasattr(model, 'module'):
         model = model.module
     
