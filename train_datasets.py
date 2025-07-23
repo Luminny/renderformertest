@@ -12,7 +12,6 @@ from renderformer.utils.transform import trans_to_cam_coord
 from renderformer.utils.ray_generator import RayGenerator
 from einops import rearrange
 
-
 class RenderFormerDataset(Dataset):
     def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline"):
         self.pipeline_type = pipeline_type
@@ -20,8 +19,27 @@ class RenderFormerDataset(Dataset):
         self.resolution = resolution
         self.max_num_tris = max_num_tris
         self.h5_files = list(self.data_dir.glob("*/*.h5"))
-        self.exr_file_path = '_normal_depth.exr' if self.pipeline_type == "GeoRasterRenderingPipeline" else '_lighting.exr'
-        self.need_texture = False if self.pipeline_type == "GeoRasterRenderingPipeline" else True
+
+        self.tile_size = 0
+        self.need_padding = False
+        self.exr_file_path = ''
+        self.need_texture = False
+
+        if self.pipeline_type == "TileBasedRenderingPipeline":
+            self.tile_size = 8
+            self.need_padding = False
+            self.exr_file_path = '_normal_depth.exr'
+            self.need_texture = False
+        elif self.pipeline_type == "GeoRasterRenderingPipeline":
+            self.exr_file_path = '_normal_depth.exr'
+            self.need_texture = False
+            self.need_padding = True
+        elif self.pipeline_type == "RenderFormerRenderingPipeline":
+            self.exr_file_path = '_lighting.exr'
+            self.need_texture = True
+            self.need_padding = True
+        else:
+            raise ValueError(f"Invalid pipeline type: {self.pipeline_type}")
         
         if len(self.h5_files) == 0:
             raise ValueError(f"No H5 files found in {data_dir}")
@@ -93,40 +111,45 @@ class RenderFormerDataset(Dataset):
                     texture = torch.from_numpy(np.array(f['texture'])).float()
         except Exception as e:
             raise Exception(f"Failed to read H5 file {h5_file}: {type(e).__name__}: {str(e)}")
+        
+        
+        
+        
 
-        # Pad triangles to max_num_tris
-        if num_tris < self.max_num_tris:
-            # Create padding for triangles [max_num_tris - num_tris, 3, 3]
-            triangles_padding = torch.zeros(
-                self.max_num_tris - num_tris, 3, 3, dtype=triangles.dtype
-            )
-            triangles = torch.cat([triangles, triangles_padding], dim=0)
-            if self.need_texture:
-                texture = torch.concatenate((texture, torch.zeros(
-                    (self.max_num_tris - num_tris, *texture.shape[1:]))), dim=0)
-            
-            # Pad vn to max_num_tris
-            vn_padding = torch.zeros(
-                self.max_num_tris - num_tris, 3, 3, dtype=vn.dtype
-            )
-            vn = torch.cat([vn, vn_padding], dim=0)
-            
-            # Create mask: True for real triangles, False for padding
-            mask = torch.cat([
-                torch.ones(num_tris, dtype=torch.bool),
-                torch.zeros(self.max_num_tris - num_tris, dtype=torch.bool)
-            ])
-        elif num_tris > self.max_num_tris:
-            # raise ValueError(f"num_tris > max_num_tris: {num_tris} > {self.max_num_tris} with file {h5_file}")
-            # Truncate if too many triangles
-            triangles = triangles[:self.max_num_tris]
-            if self.need_texture:
-                texture = texture[:self.max_num_tris]
-            vn = vn[:self.max_num_tris]
-            mask = torch.ones(self.max_num_tris, dtype=torch.bool)
-        else:
-            # Exact size, no padding needed
-            mask = torch.ones(self.max_num_tris, dtype=torch.bool)
+        if self.need_padding:
+            # Pad triangles to max_num_tris
+            if num_tris < self.max_num_tris:
+                # Create padding for triangles [max_num_tris - num_tris, 3, 3]
+                triangles_padding = torch.zeros(
+                    self.max_num_tris - num_tris, 3, 3, dtype=triangles.dtype
+                )
+                triangles = torch.cat([triangles, triangles_padding], dim=0)
+                if self.need_texture:
+                    texture = torch.concatenate((texture, torch.zeros(
+                        (self.max_num_tris - num_tris, *texture.shape[1:]))), dim=0)
+                
+                # Pad vn to max_num_tris
+                vn_padding = torch.zeros(
+                    self.max_num_tris - num_tris, 3, 3, dtype=vn.dtype
+                )
+                vn = torch.cat([vn, vn_padding], dim=0)
+                
+                # Create mask: True for real triangles, False for padding
+                mask = torch.cat([
+                    torch.ones(num_tris, dtype=torch.bool),
+                    torch.zeros(self.max_num_tris - num_tris, dtype=torch.bool)
+                ])
+            elif num_tris > self.max_num_tris:
+                # raise ValueError(f"num_tris > max_num_tris: {num_tris} > {self.max_num_tris} with file {h5_file}")
+                # Truncate if too many triangles
+                triangles = triangles[:self.max_num_tris]
+                if self.need_texture:
+                    texture = texture[:self.max_num_tris]
+                vn = vn[:self.max_num_tris]
+                mask = torch.ones(self.max_num_tris, dtype=torch.bool)
+            else:
+                # Exact size, no padding needed
+                mask = torch.ones(self.max_num_tris, dtype=torch.bool)
 
         # Load ground truth images
         gt_images_exr_file = str(h5_file).replace('.h5', self.exr_file_path)
@@ -158,12 +181,25 @@ class RenderFormerDataset(Dataset):
                 'gt_img': gt_images,
                 'file_path': str(h5_file)
             }
+        elif self.pipeline_type == "TileBasedRenderingPipeline":
+            mask_per_tile = triangle_mask_per_tile_single_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), self.resolution, tile_size=8)
+            triangles, vn, tile_mask = rearrange_triangle_base_tile(triangles, vn, mask_per_tile)
+            data = {
+                'triangles': triangles,     # [tile_num, max_num_tris_per_tile, 3, 3]
+                'mask': tile_mask,          # [tile_num, max_num_tris_per_tile]
+                'c2w': c2w,                 # [view_num, 4, 4]
+                'fov': fov,                 # [view_num, 1]
+                'vn': vn,                   # [tile_num, max_num_tris_per_tile, 3, 3]
+                'gt_img': gt_images,        # [view_num, H, W, 3]
+                'file_path': str(h5_file)   # str
+            }
         else:
             raise ValueError(f"Invalid pipeline type: {self.pipeline_type}")
         return data
 
     def __getitem__(self, idx):
         return self._load_data_with_retry(idx)
+
 
 
 def ray_triangle_intersection(triangles_aabb, rays_d):
@@ -182,10 +218,10 @@ def ray_triangle_intersection(triangles_aabb, rays_d):
     _, H, W, _ = rays_d.shape
     
     # Reshape for broadcasting
-    # triangles_aabb: [batch_size, num_tris, 2, 3] -> [batch_size, num_tris, 1, 1, 2, 3]
+    # triangles_aabb: [batch_size, num_tris, 1, 1, 2, 3]
     triangles_aabb = triangles_aabb.unsqueeze(2).unsqueeze(3)
     
-    # rays_d: [batch_size, H, W, 3] -> [batch_size, 1, H, W, 1, 3]
+    # rays_d: [batch_size, 1, H, W, 1, 3]
     rays_d = rays_d.unsqueeze(1).unsqueeze(4)
     
     # Extract min and max points of AABB
@@ -219,7 +255,7 @@ def ray_triangle_intersection(triangles_aabb, rays_d):
     
     return intersection_mask
 
-def triangle_mask_per_tile(triangles, c2w, fov, resolution, ray_generator: RayGenerator=None, tile_size=8):
+def triangle_mask_per_tile_multi_batch(triangles, c2w, fov, resolution, ray_generator: RayGenerator=None, tile_size=8):
     """
     triangles: [batch_size, num_tris, 3, 3]
     c2w: [batch_size, 4, 4]
@@ -262,15 +298,122 @@ def triangle_mask_per_tile(triangles, c2w, fov, resolution, ray_generator: RayGe
 
     return triangle_mask_per_tile
 
+def triangle_mask_per_tile_single_batch(triangles, c2w, fov, resolution, ray_generator: RayGenerator=RayGenerator(), tile_size=8):
+    """
+    triangles: [num_tris, 3, 3]
+    c2w: [num_views, 4, 4]
+    patch_size: int
+    """
+    assert c2w.shape[0] == 1
+
+    triangles_cam, c2w_cam, _ = trans_to_cam_coord(c2w, triangles.unsqueeze(0))
+
+    # calculate the AABB of every triangle
+    # [batch_size, num_tris, 3, 3] --> [batch_size, num_tris, 2, 3] 
+    triangles_aabb = torch.cat([torch.min(triangles_cam, dim=2)[0] , torch.max(triangles_cam, dim=2)[0]], dim=2)
+
+    _, rays_d = ray_generator(c2w_cam, fov / 180. * torch.pi, resolution) # [batch_size, H, W, 3]
+
+    # intersect triangles with rays and get the mask
+    # [1, num_tris, 2, 3] --> [1, num_tris, H, W]
+    bs, tn, _ = triangles_aabb.shape
+    mask_per_pixel = ray_triangle_intersection(triangles_aabb.reshape(bs, tn, 2, 3), rays_d) # [1, num_tris, H, W]
+
+    # 8*8 pixels as a tile
+    triangle_mask_per_tile = rearrange(mask_per_pixel, 'b t (h1 p1) (w1 p2) -> b (h1 w1) t (p1 p2)', p1=tile_size, p2=tile_size).max(dim=-1)[0].squeeze(0)
+
+    return triangle_mask_per_tile # [H//tile_size * W//tile_size, num_tris]
+
+
+def rearrange_triangle_base_tile(triangles, vn, tile_mask):
+    """
+    input:
+    triangles: [tris_num, 3, 3]
+    vn: [tris_num, 3, 3]
+    tile_mask: [tile_num, tris_num]
+
+    output:
+    triangles: [tile_num, max_tris_num_per_tile, 3, 3]
+    vn: [tile_num, max_tris_num_per_tile, 3, 3]
+    tile_mask: [tile_num, max_tris_num_per_tile]
+    """
+    tile_num, _ = tile_mask.shape
+    max_tris_num_per_tile = tile_mask.sum(dim=1).max().item()
+
+    triangles_padding = torch.zeros(tile_num, max_tris_num_per_tile, 3, 3, device=triangles.device, dtype=triangles.dtype)
+    vn_padding = torch.zeros(tile_num, max_tris_num_per_tile, 3, 3, device=vn.device, dtype=vn.dtype)
+    tile_mask_padding = torch.zeros(tile_num, max_tris_num_per_tile, device=tile_mask.device, dtype=tile_mask.dtype)
+
+    # get the index of non-zero elements in each tile
+    tile_idx, tri_idx = torch.where(tile_mask)
+    
+    # get the number of triangles in each tile
+    tile_counts = tile_mask.sum(dim=1)
+    
+    # create cumulative indices to locate the position of triangles in each tile
+    cumsum_counts = torch.cat([torch.zeros(1, device=tile_mask.device, dtype=torch.long), tile_counts.cumsum(0)[:-1]])
+    
+    # get the position of non-zero elements in the padding tensor
+    positions = torch.arange(len(tile_idx), device=tile_mask.device) - cumsum_counts[tile_idx]
+    
+    # fill the padding tensor with the triangles and tile_mask
+    triangles_padding[tile_idx, positions] = triangles[tri_idx]
+    vn_padding[tile_idx, positions] = vn[tri_idx]
+    tile_mask_padding[tile_idx, positions] = tile_mask[tile_idx, tri_idx]
+
+    return triangles_padding, vn_padding, tile_mask_padding
+
+def test_rearrange_triangle_base_tile():
+    """测试向量化版本的正确性"""
+    import torch
+    
+    # 创建测试数据
+    tri_num = 10
+    tile_num = 4
+    triangles = torch.randn(tri_num, 3, 3)
+    tile_mask = torch.randint(0, 2, (tile_num, tri_num), dtype=torch.bool)
+    
+    # 原始版本（需要先定义）
+    def original_rearrange_triangle_base_tile(triangles, tile_mask):
+        tile_num, tri_num = tile_mask.shape
+        max_tris_num_per_tile = tile_mask.sum(dim=1).max().item()
+        print(f"max_tris_num_per_tile: {max_tris_num_per_tile}")
+
+        triangles_padding = torch.zeros(tile_num, max_tris_num_per_tile, 3, 3, device=triangles.device, dtype=triangles.dtype)
+        tile_mask_padding = torch.zeros(tile_num, max_tris_num_per_tile, device=tile_mask.device, dtype=tile_mask.dtype)
+
+        for i in range(tile_num):
+            triangles_padding[i, :tile_mask[i].sum()] = triangles[tile_mask[i].nonzero().squeeze(-1)]
+            tile_mask_padding[i, :tile_mask[i].sum()] = tile_mask[i][tile_mask[i].nonzero().squeeze(-1)]
+
+        return triangles_padding, tile_mask_padding
+    
+    # 运行两个版本
+    result_orig = original_rearrange_triangle_base_tile(triangles, tile_mask)
+    result_vect = rearrange_triangle_base_tile(triangles, tile_mask)
+    
+    # 比较结果
+    print("原始版本和向量化版本结果是否相同:")
+    print(f"triangles_padding: {torch.allclose(result_orig[0], result_vect[0])}")
+    print(f"tile_mask_padding: {torch.allclose(result_orig[1], result_vect[1])}")
+    
+    # print(f"tile_mask: {tile_mask}")
+    # print(f"triangles: {triangles}")
+    # print(f"result_vect[0]: {result_vect[0]}")
+    # print(f"result_vect[1]: {result_vect[1]}")
+    
+    return result_orig, result_vect
 
 if __name__ == "__main__":
+    # test_rearrange_triangle_base_tile()
+    
     from torch.utils.data import DataLoader
 
     train_data_dir = r"F:\projects\renderformer\traindata\tri1024_v2"
     resolution = 256
     max_num_tris = 2048
-    pipeline_type = "GeoRasterRenderingPipeline"
-    batch_size = 4
+    pipeline_type = "TileBasedRenderingPipeline"
+    batch_size = 1
     device = torch.device('cuda')
     train_dataset = RenderFormerDataset(train_data_dir, resolution, max_num_tris, pipeline_type)
 
@@ -290,6 +433,12 @@ if __name__ == "__main__":
         c2w = data['c2w'].to(device)
         fov = data['fov'].to(device)
 
-        mask = triangle_mask_per_tile(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), resolution, ray_generator=RayGenerator().to(device), tile_size=32)
+        print(f"mask: {mask.shape}")
+        print(f"triangles: {triangles.shape}")
+        print(f"vn: {vn.shape}")
+        print(f"c2w: {c2w.shape}")
+        print(f"fov: {fov.shape}")
+
+        # mask = triangle_mask_per_tile_multi_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), resolution, ray_generator=RayGenerator().to(device), tile_size=32)
         # print(f"mask: {mask}")
         break
