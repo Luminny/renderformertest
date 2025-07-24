@@ -74,6 +74,8 @@ class RenderFormerConfig:
     """The number of frequencies in the positional encoding for view direction."""
     patch_size: int = 8
     """The size of the image patch in the view transformer."""
+    tile_size: int = 32
+    """The size of the tile in the tile-based rendering pipeline."""
     include_alpha: bool = False
     """Whether to include the alpha channel in the texture patch."""
     use_dpt_decoder: bool = False

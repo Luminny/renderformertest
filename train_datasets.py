@@ -111,10 +111,6 @@ class RenderFormerDataset(Dataset):
                     texture = torch.from_numpy(np.array(f['texture'])).float()
         except Exception as e:
             raise Exception(f"Failed to read H5 file {h5_file}: {type(e).__name__}: {str(e)}")
-        
-        
-        
-        
 
         if self.need_padding:
             # Pad triangles to max_num_tris
@@ -125,8 +121,11 @@ class RenderFormerDataset(Dataset):
                 )
                 triangles = torch.cat([triangles, triangles_padding], dim=0)
                 if self.need_texture:
-                    texture = torch.concatenate((texture, torch.zeros(
-                        (self.max_num_tris - num_tris, *texture.shape[1:]))), dim=0)
+                    texture = torch.concatenate(
+                        (texture, torch.zeros(
+                            (self.max_num_tris - num_tris, *texture.shape[1:])
+                        )), dim=0
+                    )
                 
                 # Pad vn to max_num_tris
                 vn_padding = torch.zeros(
@@ -140,7 +139,8 @@ class RenderFormerDataset(Dataset):
                     torch.zeros(self.max_num_tris - num_tris, dtype=torch.bool)
                 ])
             elif num_tris > self.max_num_tris:
-                # raise ValueError(f"num_tris > max_num_tris: {num_tris} > {self.max_num_tris} with file {h5_file}")
+                # raise ValueError(f"num_tris > max_num_tris: {num_tris} > "
+                #                f"{self.max_num_tris} with file {h5_file}")
                 # Truncate if too many triangles
                 triangles = triangles[:self.max_num_tris]
                 if self.need_texture:
@@ -158,7 +158,8 @@ class RenderFormerDataset(Dataset):
                 imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
             ).unsqueeze(0)
         except Exception as e:
-            raise Exception(f"Failed to read EXR file {gt_images_exr_file}: {type(e).__name__}: {str(e)}")
+            raise Exception(f"Failed to read EXR file {gt_images_exr_file}: "
+                          f"{type(e).__name__}: {str(e)}")
 
         if self.pipeline_type == "GeoRasterRenderingPipeline":
             data = {
@@ -182,7 +183,7 @@ class RenderFormerDataset(Dataset):
                 'file_path': str(h5_file)
             }
         elif self.pipeline_type == "TileBasedRenderingPipeline":
-            mask_per_tile = triangle_mask_per_tile_single_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), self.resolution, tile_size=8)
+            mask_per_tile = triangle_mask_per_tile_single_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), self.resolution, ray_generator=RayGenerator().to(triangles.device), tile_size=32)
             triangles, vn, tile_mask = rearrange_triangle_base_tile(triangles, vn, mask_per_tile)
             data = {
                 'triangles': triangles,     # [tile_num, max_num_tris_per_tile, 3, 3]
@@ -404,41 +405,141 @@ def test_rearrange_triangle_base_tile():
     
     return result_orig, result_vect
 
+def tile_based_collate_fn(batch):
+    """
+    Collate function for TileBasedRenderingPipeline to handle variable length data.
+    
+    Args:
+        batch: List of data dictionaries from dataset
+        
+    Returns:
+        Collated batch with padded tensors
+    """
+    if not batch:
+        return {}
+    
+    # Extract all data from batch
+    triangles_list = [item['triangles'] for item in batch]  # [tile_num, max_num_tris_per_tile, 3, 3]
+    vn_list = [item['vn'] for item in batch]  # [tile_num, max_num_tris_per_tile, 3, 3]
+    mask_list = [item['mask'] for item in batch]  # [tile_num, max_num_tris_per_tile]
+    c2w_list = [item['c2w'] for item in batch]  # [view_num, 4, 4]
+    fov_list = [item['fov'] for item in batch]  # [view_num, 1]
+    gt_img_list = [item['gt_img'] for item in batch]  # [view_num, H, W, 3]
+    file_path_list = [item['file_path'] for item in batch]  # str
+    
+    # Get batch size
+    batch_size = len(batch)
+    
+    # Find the maximum number of triangles per tile across the batch
+    max_tris_per_tile = max(tri.shape[1] for tri in triangles_list)
+    tile_num = triangles_list[0].shape[0]
+    
+    # Create padded tensors
+    device = triangles_list[0].device
+    dtype_triangles = triangles_list[0].dtype
+    dtype_vn = vn_list[0].dtype
+    dtype_mask = mask_list[0].dtype
+    
+    # Initialize padded tensors
+    triangles_padded = torch.zeros(batch_size, tile_num, max_tris_per_tile, 3, 3, 
+                                  device=device, dtype=dtype_triangles)
+    vn_padded = torch.zeros(batch_size, tile_num, max_tris_per_tile, 3, 3, 
+                           device=device, dtype=dtype_vn)
+    mask_padded = torch.zeros(batch_size, tile_num, max_tris_per_tile, 
+                             device=device, dtype=dtype_mask)
+    
+    # Fill padded tensors
+    for i, (triangles, vn, mask) in enumerate(zip(triangles_list, vn_list, mask_list)):
+        current_max_tris = triangles.shape[1]
+        triangles_padded[i, :, :current_max_tris] = triangles
+        vn_padded[i, :, :current_max_tris] = vn
+        mask_padded[i, :, :current_max_tris] = mask
+    
+    # Stack other tensors (they should have the same shape across batch)
+    c2w_stacked = torch.stack(c2w_list, dim=0)  # [batch_size, view_num, 4, 4]
+    fov_stacked = torch.stack(fov_list, dim=0)  # [batch_size, view_num, 1]
+    gt_img_stacked = torch.stack(gt_img_list, dim=0)  # [batch_size, view_num, H, W, 3]
+    
+    return {
+        'triangles': triangles_padded,  # [batch_size, tile_num, max_tris_per_tile, 3, 3]
+        'vn': vn_padded,  # [batch_size, tile_num, max_tris_per_tile, 3, 3]
+        'mask': mask_padded,  # [batch_size, tile_num, max_tris_per_tile]
+        'c2w': c2w_stacked,  # [batch_size, view_num, 4, 4]
+        'fov': fov_stacked,  # [batch_size, view_num, 1]
+        'gt_img': gt_img_stacked,  # [batch_size, view_num, H, W, 3]
+        'file_path': file_path_list,  # List[str]
+    }
+
+
 if __name__ == "__main__":
     # test_rearrange_triangle_base_tile()
-    
+    import time
     from torch.utils.data import DataLoader
+    from renderformer import TileBasedRenderingPipeline
+    from renderformer.models.config import RenderFormerConfig
+    from renderformer.models.geo_raster import GeoRaster
 
+    model_config_path = r"F:\projects\renderformer\renderformer-v1-base\config.json"
     train_data_dir = r"F:\projects\renderformer\traindata\tri1024_v2"
     resolution = 256
     max_num_tris = 2048
     pipeline_type = "TileBasedRenderingPipeline"
-    batch_size = 1
+    batch_size = 2  # Changed to 2 to test collate_fn
     device = torch.device('cuda')
     train_dataset = RenderFormerDataset(train_data_dir, resolution, max_num_tris, pipeline_type)
 
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        sampler=None,
-        num_workers=0,
-        pin_memory=True
-    )
+    model_config = RenderFormerConfig.from_json(model_config_path)
+    pipeline = TileBasedRenderingPipeline(GeoRaster(model_config)).to(device)
+
+    # Use collate_fn for TileBasedRenderingPipeline
+    if pipeline_type == "TileBasedRenderingPipeline":
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            sampler=None,
+            num_workers=8,
+            pin_memory=True,
+            collate_fn=tile_based_collate_fn
+        )
+    else:
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            sampler=None,
+            num_workers=0,
+            pin_memory=True
+        )
 
     for batch_idx, data in enumerate(train_dataloader):
+        # print time 
+        start_time = time.time()
         triangles = data['triangles'].to(device)
         mask = data['mask'].to(device)
         vn = data['vn'].to(device)
         c2w = data['c2w'].to(device)
         fov = data['fov'].to(device)
 
-        print(f"mask: {mask.shape}")
-        print(f"triangles: {triangles.shape}")
-        print(f"vn: {vn.shape}")
-        print(f"c2w: {c2w.shape}")
-        print(f"fov: {fov.shape}")
+        print(f"Batch {batch_idx}:")
+        print(f"  triangles: {triangles.shape}")
+        print(f"  mask: {mask.shape}")
+        print(f"  vn: {vn.shape}")
+        print(f"  c2w: {c2w.shape}")
+        print(f"  fov: {fov.shape}")
+
+        rendered_imgs = pipeline(
+            data=data,
+            resolution=resolution,
+            torch_dtype=torch.bfloat16,
+            device=device,
+        )
+
+        print(f"rendered_imgs: {rendered_imgs.shape}")
 
         # mask = triangle_mask_per_tile_multi_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), resolution, ray_generator=RayGenerator().to(device), tile_size=32)
         # print(f"mask: {mask}")
-        break
+        end_time = time.time()
+        print(f"Time taken: {end_time - start_time} seconds")
+        if batch_idx > 4:
+            break
