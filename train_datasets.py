@@ -159,6 +159,20 @@ class RenderFormerDataset(Dataset):
             gt_images = torch.from_numpy(
                 imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
             ).unsqueeze(0)
+            
+            # Check if the loaded image resolution matches self.resolution
+            # gt_images shape: [1, H, W, 3]
+            loaded_height, loaded_width = gt_images.shape[1], gt_images.shape[2]
+            
+            if loaded_height != self.resolution or loaded_width != self.resolution:
+                # Resize the image to match self.resolution
+                gt_images = torch.nn.functional.interpolate(
+                    gt_images.permute(0, 3, 1, 2),  # [1, 3, H, W]
+                    size=(self.resolution, self.resolution),
+                    mode='bilinear',
+                    align_corners=False
+                ).permute(0, 2, 3, 1)  # [1, H, W, 3]
+                
         except Exception as e:
             raise Exception(f"Failed to read EXR file {gt_images_exr_file}: "
                           f"{type(e).__name__}: {str(e)}")
