@@ -63,6 +63,8 @@ def save_to_h5(scene_config: SceneConfig, mesh_path: str, output_h5_path: str):
         texture = np.repeat(np.repeat(texture[..., None], size, axis=-1)[..., None], size, axis=-1)
         texture[:, :, ~mask] = 0.0
 
+        print(f"{obj_key} triangles shape: {triangles.shape}")
+
         all_triangles.append(triangles)
         all_vn.append(vn)
         all_texture.append(texture)

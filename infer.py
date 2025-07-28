@@ -9,7 +9,7 @@ from renderformer import RenderFormerRenderingPipeline
 from simple_ocio import ToneMapper
 
 
-def load_single_h5_data(file_path):
+def load_single_h5_data(file_path, max_num_tris=None):
     with h5py.File(file_path, 'r') as f:
         triangles = torch.from_numpy(np.array(f['triangles']).astype(np.float32))
         num_tris = triangles.shape[0]
@@ -18,6 +18,22 @@ def load_single_h5_data(file_path):
         vn = torch.from_numpy(np.array(f['vn']).astype(np.float32))
         c2w = torch.from_numpy(np.array(f['c2w']).astype(np.float32))
         fov = torch.from_numpy(np.array(f['fov']).astype(np.float32))
+
+        if max_num_tris is not None:
+            triangles = triangles[:max_num_tris]
+            texture = texture[:max_num_tris]
+            vn = vn[:max_num_tris]
+            mask = mask[:max_num_tris]
+
+            # triangles = triangles[-max_num_tris:]
+            # texture = texture[-max_num_tris:]
+            # vn = vn[-max_num_tris:]
+            # mask = mask[-max_num_tris:]
+
+            # triangles = triangles[-max_num_tris:-512]
+            # texture = texture[-max_num_tris:-512]
+            # vn = vn[-max_num_tris:-512]
+            # mask = mask[-max_num_tris:-512]
 
         data = {
             'triangles': triangles,
@@ -62,7 +78,7 @@ def main():
         print(f"Using {args.tone_mapper} tone mapper")
 
     # Load data and move to device
-    data = load_single_h5_data(args.h5_file)
+    data = load_single_h5_data(args.h5_file, max_num_tris=None)
 
     # Add batch dimension to all tensors
     triangles = data['triangles'].unsqueeze(0).to(device)
@@ -72,7 +88,9 @@ def main():
     c2w = data['c2w'].unsqueeze(0).to(device)
     fov = data['fov'].unsqueeze(0).unsqueeze(-1).to(device)
 
-    rendered_imgs = pipeline(
+    print(f"triangles shape: {triangles.shape}")
+
+    rendered_imgs = pipeline.render(
         triangles=triangles,
         texture=texture,
         mask=mask,

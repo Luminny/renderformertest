@@ -75,7 +75,7 @@ class TileBasedRenderingPipeline:
             rays_d=tile_rays_d,
             torch_dtype=torch_dtype,
         ) # [bn*tile_num, view_num, tile_resolution, tile_resolution, 3]
-        print(f"rendered_tiles: {rendered_tiles.shape}")
+        # print(f"rendered_tiles: {rendered_tiles.shape}")
 
         rendered_imgs = rearrange(
             rendered_tiles, '(b h1 w1) nv t1 t2 c -> b nv (h1 t1) (w1 t2) c', 

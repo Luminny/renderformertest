@@ -13,7 +13,7 @@ from renderformer.utils.ray_generator import RayGenerator
 from einops import rearrange
 
 class RenderFormerDataset(Dataset):
-    def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline"):
+    def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline", tile_size=32):
         self.pipeline_type = pipeline_type
         self.data_dir = Path(data_dir)
         self.resolution = resolution
@@ -26,7 +26,9 @@ class RenderFormerDataset(Dataset):
         self.need_texture = False
 
         if self.pipeline_type == "TileBasedRenderingPipeline":
-            self.tile_size = 8
+            self.tile_size = tile_size
+            self.tile_resolution = resolution // tile_size
+            self.tile_num = self.tile_resolution ** 2
             self.need_padding = False
             self.exr_file_path = '_normal_depth.exr'
             self.need_texture = False
@@ -183,8 +185,14 @@ class RenderFormerDataset(Dataset):
                 'file_path': str(h5_file)
             }
         elif self.pipeline_type == "TileBasedRenderingPipeline":
-            mask_per_tile = triangle_mask_per_tile_single_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), self.resolution, ray_generator=RayGenerator().to(triangles.device), tile_size=32)
+            mask_per_tile = triangle_mask_per_tile_single_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), self.resolution, ray_generator=RayGenerator().to(triangles.device), tile_size=self.tile_size)
             triangles, vn, tile_mask = rearrange_triangle_base_tile(triangles, vn, mask_per_tile)
+            
+            # tri_num = triangles.shape[0]
+            # triangles = torch.repeat_interleave(triangles.unsqueeze(0), self.tile_num, dim=0)
+            # vn = torch.repeat_interleave(vn.unsqueeze(0), self.tile_num, dim=0)
+            # tile_mask = torch.ones([self.tile_num, tri_num], dtype=torch.bool)
+
             data = {
                 'triangles': triangles,     # [tile_num, max_num_tris_per_tile, 3, 3]
                 'mask': tile_mask,          # [tile_num, max_num_tris_per_tile]
@@ -473,23 +481,42 @@ def tile_based_collate_fn(batch):
 
 if __name__ == "__main__":
     # test_rearrange_triangle_base_tile()
+    import os
+    import imageio
+    import numpy as np
     import time
     from torch.utils.data import DataLoader
-    from renderformer import TileBasedRenderingPipeline
+    from renderformer import TileBasedRenderingPipeline, GeoRasterRenderingPipeline
     from renderformer.models.config import RenderFormerConfig
     from renderformer.models.geo_raster import GeoRaster
 
+    # output_dir = r"/home/luminyang/workspaces/renderformer/training/0718/02"
+    output_dir = r"/home/luminyang/workspaces/renderformer/training/0718/03/test"
+    pretrain_from = r"/home/luminyang/workspaces/renderformer/training/0718/03/final_model"
+    # pretrain_from = r"/home/luminyang/workspaces/renderformer/training/0718/02/final_model"
     model_config_path = r"F:\projects\renderformer\renderformer-v1-base\config.json"
-    train_data_dir = r"F:\projects\renderformer\traindata\tri1024_v2"
-    resolution = 256
+    train_data_dir = r"/home/luminyang/workspaces/renderformer/traindata/tri1024_v02"
+    resolution = 128
     max_num_tris = 2048
+    tile_size = 8
+    # max_num_tris = 1024
     pipeline_type = "TileBasedRenderingPipeline"
-    batch_size = 2  # Changed to 2 to test collate_fn
+    # pipeline_type = "GeoRasterRenderingPipeline"
+    # batch_size = 16  # Changed to 2 to test collate_fn
+    batch_size = 1  # Changed to 2 to test collate_fn
     device = torch.device('cuda')
-    train_dataset = RenderFormerDataset(train_data_dir, resolution, max_num_tris, pipeline_type)
+    train_dataset = RenderFormerDataset(train_data_dir, resolution, max_num_tris, pipeline_type, tile_size)
 
-    model_config = RenderFormerConfig.from_json(model_config_path)
-    pipeline = TileBasedRenderingPipeline(GeoRaster(model_config)).to(device)
+    # model_config = RenderFormerConfig.from_json(model_config_path)
+    # pipeline = TileBasedRenderingPipeline(GeoRaster(model_config)).to(device)
+    pipeline = TileBasedRenderingPipeline.from_pretrained(pretrain_from).to(device)
+    # pipeline = GeoRasterRenderingPipeline.from_pretrained(pretrain_from).to(device)
+    
+    # Create a new config with updated tile_size since the original config is frozen
+    from dataclasses import replace
+    new_config = replace(pipeline.model.config, tile_size=tile_size)
+    pipeline.model.config = new_config
+    pipeline.config = new_config
 
     # Use collate_fn for TileBasedRenderingPipeline
     if pipeline_type == "TileBasedRenderingPipeline":
@@ -527,19 +554,48 @@ if __name__ == "__main__":
         print(f"  vn: {vn.shape}")
         print(f"  c2w: {c2w.shape}")
         print(f"  fov: {fov.shape}")
+        print(f"  file_path: {data['file_path']}")
+
+        # with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16):
+        #     rendered_imgs = pipeline(
+        #         data=data,
+        #         resolution=resolution,
+        #         torch_dtype=torch.float16,
+        #         device=device,
+        #     )
 
         rendered_imgs = pipeline(
             data=data,
             resolution=resolution,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch.float16,
             device=device,
         )
 
         print(f"rendered_imgs: {rendered_imgs.shape}")
+        print("Allocated:", torch.cuda.memory_allocated() / (1024**2), "MB")
+        print("Reserved:", torch.cuda.memory_reserved() / (1024**2), "MB")
 
         # mask = triangle_mask_per_tile_multi_batch(triangles, c2w.reshape(-1, 4, 4), fov.reshape(-1, 1), resolution, ray_generator=RayGenerator().to(device), tile_size=32)
         # print(f"mask: {mask}")
         end_time = time.time()
         print(f"Time taken: {end_time - start_time} seconds")
-        if batch_idx > 4:
-            break
+
+        for i in range(batch_size):
+            base_name = 'test'
+
+            nv = c2w.shape[1]
+            for view_idx in range(nv):
+                hdr_img = rendered_imgs[i, view_idx].cpu().detach().numpy().astype(np.float32)
+                ldr_img = np.clip(hdr_img, 0, 1)
+                ldr_img = (ldr_img * 255).astype(np.uint8)
+
+                # hdr_path = os.path.join(output_dir, f"{base_name}_view_{view_idx}.exr")
+                ldr_path = os.path.join(output_dir, f"{base_name}_batch_{batch_idx}_{i}_view_{view_idx}_{pipeline_type}_{max_num_tris}.png")
+
+                # imageio.v3.imwrite(hdr_path, hdr_img)
+                imageio.v3.imwrite(ldr_path, ldr_img)
+        
+        # if batch_idx > 8:
+        #     break
+
+        break

@@ -39,14 +39,14 @@ from datetime import datetime
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from renderformer import GeoRasterRenderingPipeline, RenderFormerRenderingPipeline
+from renderformer import GeoRasterRenderingPipeline, RenderFormerRenderingPipeline, TileBasedRenderingPipeline
 from renderformer.models.config import RenderFormerConfig
 from renderformer.models.geo_raster import GeoRaster
 from renderformer.models.renderformer import RenderFormer
 
 from train_loss import compute_loss, loss_fn_alex
 from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state
-from train_datasets import RenderFormerDataset
+from train_datasets import RenderFormerDataset, tile_based_collate_fn
 
 
 def setup_distributed():
@@ -160,7 +160,7 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                 tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
                 
                 # Log gradient norms by module every 100 steps
-                if global_step % 100 == 1:
+                if global_step % 1000 == 1:
                     gradient_stats = compute_gradient_stats_by_module(pipeline.model)
                     for module_name, stats in gradient_stats.items():
                         tb_writer.add_scalar(f'Gradients/{module_name}/Mean', stats['mean'], global_step)
@@ -369,6 +369,9 @@ def main():
     elif args.pipeline_type == "RenderFormerRenderingPipeline":
         PIPELINE_CLASS = RenderFormerRenderingPipeline
         MODEL_CLASS = RenderFormer
+    elif args.pipeline_type == "TileBasedRenderingPipeline":
+        PIPELINE_CLASS = TileBasedRenderingPipeline
+        MODEL_CLASS = GeoRaster
     else:
         raise ValueError(f"Invalid pipeline type: {args.pipeline_type}")
     
@@ -474,14 +477,25 @@ def main():
         train_sampler = None
         shuffle = True
     
-    train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=shuffle,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True
-    )
+    if args.pipeline_type == "TileBasedRenderingPipeline":
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=shuffle,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=tile_based_collate_fn
+        )
+    else:
+        train_dataloader = DataLoader(
+            train_dataset, 
+            batch_size=args.batch_size, 
+            shuffle=shuffle,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
     
     val_dataloader = None
     val_sampler = None
