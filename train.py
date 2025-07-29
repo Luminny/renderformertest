@@ -1,25 +1,11 @@
 """
-RenderFormer Training Script with TensorBoard and Wandb Support
+RenderFormer Training Script with Wandb Support
 
 This script provides comprehensive training for RenderFormer models with:
-- TensorBoard visualization for loss curves, gradients, and sample images
-- Wandb integration for experiment tracking
+- Wandb integration for experiment tracking and visualization
 - Multi-GPU support with DistributedDataParallel
 - Flexible loss functions (L1, L2, LPIPS)
 - Checkpoint saving and resuming
-
-Usage:
-    # Basic training with TensorBoard
-    python train_geo_raster.py --train_data_dir /path/to/data --use_tensorboard
-    
-    # View TensorBoard logs
-    tensorboard --logdir ./tensorboard_logs
-    
-    # Training with both TensorBoard and Wandb
-    python train_geo_raster.py --train_data_dir /path/to/data --use_tensorboard --use_wandb
-    
-    # Distributed training with multiple GPUs
-    torchrun --nproc_per_node=8 train.py --train_data_dir /path/to/data --use_tensorboard
 """
 
 import os
@@ -32,7 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
 from datetime import datetime
@@ -154,32 +140,70 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
             num_batches += 1
             
             # Log to TensorBoard
-            if tb_writer:
+            # if tb_writer:
+            #     global_step = epoch * len(dataloader) + batch_idx
+            #     tb_writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+            #     tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
+            #     
+            #     # Log gradient norms by module every 100 steps
+            #     if global_step % 1000 == 1:
+            #         gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+            #         for module_name, stats in gradient_stats.items():
+            #             tb_writer.add_scalar(f'Gradients/{module_name}/Mean', stats['mean'], global_step)
+            #             tb_writer.add_scalar(f'Gradients/{module_name}/Max', stats['max'], global_step)
+            #     
+            #     # Log sample images every 500 steps
+            #     if global_step % 25 == 0 and gt_images is not None:
+            #         # Take first image from batch for visualization
+            #         pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
+            #         gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
+            #         
+            #         # Convert to format for TensorBoard (CHW)
+            #         pred_img = pred_img.permute(2, 0, 1)  # [3, H, W]
+            #         gt_img = gt_img.permute(2, 0, 1)  # [3, H, W]
+
+            #         # concatenate pred_img and gt_img
+            #         concat_img = torch.cat([pred_img, gt_img], dim=2)
+            #         
+            #         tb_writer.add_image('Images/Prediction_Ground_Truth', concat_img, global_step)
+            
+            # Log to Wandb (only on rank 0)
+            if config.use_wandb and rank == 0:
                 global_step = epoch * len(dataloader) + batch_idx
-                tb_writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-                tb_writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
+                wandb.log({
+                    'train_loss': loss.item(),
+                    'learning_rate': scheduler.get_last_lr()[0],
+                    'batch': batch_idx,
+                    'global_step': global_step
+                })
                 
-                # Log gradient norms by module every 100 steps
+                # Log gradient norms by module every 1000 steps
                 if global_step % 1000 == 1:
                     gradient_stats = compute_gradient_stats_by_module(pipeline.model)
                     for module_name, stats in gradient_stats.items():
-                        tb_writer.add_scalar(f'Gradients/{module_name}/Mean', stats['mean'], global_step)
-                        tb_writer.add_scalar(f'Gradients/{module_name}/Max', stats['max'], global_step)
+                        wandb.log({
+                            f'gradients/{module_name}/mean': stats['mean'],
+                            f'gradients/{module_name}/max': stats['max'],
+                            'global_step': global_step
+                        })
                 
-                # Log sample images every 500 steps
-                if global_step % 25 == 0 and gt_images is not None:
+                # Log sample images every 50 steps
+                if global_step % 50 == 0 and gt_images is not None:
                     # Take first image from batch for visualization
                     pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
                     gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
                     
-                    # Convert to format for TensorBoard (CHW)
+                    # Convert to format for Wandb (CHW)
                     pred_img = pred_img.permute(2, 0, 1)  # [3, H, W]
                     gt_img = gt_img.permute(2, 0, 1)  # [3, H, W]
 
                     # concatenate pred_img and gt_img
                     concat_img = torch.cat([pred_img, gt_img], dim=2)
                     
-                    tb_writer.add_image('Images/Prediction_Ground_Truth', concat_img, global_step)
+                    wandb.log({
+                        'images/prediction_ground_truth': wandb.Image(concat_img),
+                        'global_step': global_step
+                    })
             
             # Update progress bar (only on rank 0)
             if rank == 0:
@@ -188,13 +212,6 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                     'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                 })
             
-            # Log to wandb
-            if config.use_wandb:
-                wandb.log({
-                    'train_loss': loss.item(),
-                    'learning_rate': scheduler.get_last_lr()[0],
-                    'batch': batch_idx
-                })
                 
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -334,8 +351,10 @@ def main():
                        help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", type=str, default="renderformer", 
                        help="W&B project name")
-    parser.add_argument("--wandb_run_name", type=str, 
+    parser.add_argument("--wandb_run_name", type=str, default="test_run", 
                        help="W&B run name")
+    parser.add_argument("--wandb_dir", type=str, 
+                       help="Directory to store wandb local files (default: ./wandb)")
     parser.add_argument("--use_tensorboard", action="store_true", 
                        help="Use TensorBoard for logging")
     parser.add_argument("--log_dir", type=str, default="./logs", 
@@ -379,24 +398,31 @@ def main():
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize wandb if requested (only on rank 0)
+    # Initialize TensorBoard if requested (only on rank 0)
+    # tb_writer = None
+    # tb_log_dir = None
+    # if args.use_tensorboard and rank == 0:
+    #     tb_log_dir = os.path.join(args.log_dir, 
+    #                              f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    #     os.makedirs(tb_log_dir, exist_ok=True)
+    #     tb_writer = SummaryWriter(log_dir=tb_log_dir)
+    #     print(f"TensorBoard logs will be saved to: {tb_log_dir}")
+    #     print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
+    
+    # Initialize Wandb if requested (only on rank 0)
     if args.use_wandb and rank == 0:
+        # Set wandb directory if specified
+        if args.wandb_dir:
+            os.environ['WANDB_DIR'] = args.wandb_dir
+            print(f"Wandb local files will be saved to: {args.wandb_dir}")
+        
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
-            config=vars(args)
+            config=vars(args),
+            dir=args.wandb_dir if args.wandb_dir else None
         )
-    
-    # Initialize TensorBoard if requested (only on rank 0)
-    tb_writer = None
-    tb_log_dir = None
-    if args.use_tensorboard and rank == 0:
-        tb_log_dir = os.path.join(args.log_dir, 
-                                 f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        os.makedirs(tb_log_dir, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=tb_log_dir)
-        print(f"TensorBoard logs will be saved to: {tb_log_dir}")
-        print(f"Run 'tensorboard --logdir {args.log_dir}' to view logs")
+        print(f"Wandb initialized with project: {args.wandb_project}, run: {args.wandb_run_name}")
 
     # Setup logging file (only on rank 0)
     log_file = os.path.join(args.output_dir, "training_log.txt")
@@ -407,7 +433,7 @@ def main():
             f.write("=" * 50 + "\n")
             f.write(f"Arguments: {vars(args)}\n")
             f.write("=" * 50 + "\n")
-            f.write(f"TensorBoard logs will be saved to: {tb_log_dir}\n")
+            # f.write(f"TensorBoard logs will be saved to: {tb_log_dir}\n")
             f.write("=" * 50 + "\n")
     
     # Init model
@@ -574,6 +600,11 @@ def main():
         print(f"  - Total steps: {total_steps}")
         print(f"  - Target LR: {args.learning_rate}")
         print(f"  - Min LR: {args.learning_rate * args.min_lr_ratio} (ratio: {args.min_lr_ratio})")
+        
+        if args.use_wandb:
+            print(f"Wandb logging enabled - project: {args.wandb_project}, run: {args.wandb_run_name}")
+        # if args.use_tensorboard:
+        #     print(f"TensorBoard logging enabled - logs saved to: {tb_log_dir}")
     
 
     start_epoch = 0
@@ -584,16 +615,30 @@ def main():
             print(f"Resuming training from epoch {start_epoch}")
     
     # Print gradient monitoring info (only on rank 0)
-    if args.use_tensorboard and rank == 0:
+    # if args.use_tensorboard and rank == 0:
+    #     print("\n" + "="*60)
+    #     print("GRADIENT MONITORING ENABLED")
+    #     print("="*60)
+    #     print("The following gradient statistics will be logged to TensorBoard:")
+    #     print("- Module-level gradient means, max")
+    #     print("- Both per-batch (every 100 steps) and per-epoch statistics")
+    #     print("TensorBoard sections:")
+    #     print("  - Gradients/* : Per-batch gradient statistics")
+    #     print("  - Gradients_Epoch/* : Per-epoch gradient statistics")
+    #     print("="*60)
+    
+    # Print gradient monitoring info for Wandb (only on rank 0)
+    if args.use_wandb and rank == 0:
         print("\n" + "="*60)
-        print("GRADIENT MONITORING ENABLED")
+        print("GRADIENT MONITORING ENABLED (WANDB)")
         print("="*60)
-        print("The following gradient statistics will be logged to TensorBoard:")
+        print("The following gradient statistics will be logged to Wandb:")
         print("- Module-level gradient means, max")
-        print("- Both per-batch (every 100 steps) and per-epoch statistics")
-        print("TensorBoard sections:")
-        print("  - Gradients/* : Per-batch gradient statistics")
-        print("  - Gradients_Epoch/* : Per-epoch gradient statistics")
+        print("- Both per-batch (every 1000 steps) and per-epoch statistics")
+        print("Wandb sections:")
+        print("  - gradients/* : Per-batch gradient statistics")
+        print("  - gradients_epoch/* : Per-epoch gradient statistics")
+        print("  - images/prediction_ground_truth : Sample images")
         print("="*60)
     
     # Training loop
@@ -606,19 +651,35 @@ def main():
             train_sampler.set_epoch(epoch)
         
         # Train
-        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, tb_writer, epoch, rank)
+        train_loss = train_epoch(pipeline, train_dataloader, optimizer, scheduler, device, args, scaler, None, epoch, rank)
         if rank == 0:
             print(f"Training loss: {train_loss:.6f}")
         
         # Log epoch training loss to TensorBoard (only on rank 0)
-        if tb_writer and rank == 0:
-            tb_writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
+        # if tb_writer and rank == 0:
+        #     tb_writer.add_scalar('Loss/Train_Epoch', train_loss, epoch)
+        #     
+        #     # Log gradient statistics at epoch end
+        #     gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+        #     for module_name, stats in gradient_stats.items():
+        #         tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Mean', stats['mean'], epoch)
+        #         tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Max', stats['max'], epoch)
+        
+        # Log epoch training loss to Wandb (only on rank 0)
+        if args.use_wandb and rank == 0:
+            wandb.log({
+                'epoch': epoch,
+                'train_loss_epoch': train_loss
+            })
             
             # Log gradient statistics at epoch end
             gradient_stats = compute_gradient_stats_by_module(pipeline.model)
             for module_name, stats in gradient_stats.items():
-                tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Mean', stats['mean'], epoch)
-                tb_writer.add_scalar(f'Gradients_Epoch/{module_name}/Max', stats['max'], epoch)
+                wandb.log({
+                    f'gradients_epoch/{module_name}/mean': stats['mean'],
+                    f'gradients_epoch/{module_name}/max': stats['max'],
+                    'epoch': epoch
+                })
         
         # Validate
         val_loss = None
@@ -628,8 +689,8 @@ def main():
                 print(f"Validation loss: {val_loss:.6f}")
             
             # Log to TensorBoard (only on rank 0)
-            if tb_writer and rank == 0:
-                tb_writer.add_scalar('Loss/Validation_Epoch', val_loss, epoch)
+            # if tb_writer and rank == 0:
+            #     tb_writer.add_scalar('Loss/Validation_Epoch', val_loss, epoch)
             
             # Log to wandb (only on rank 0)
             if args.use_wandb and rank == 0:
@@ -680,9 +741,9 @@ def main():
         print("Training completed!")
         
         # Close TensorBoard writer
-        if tb_writer:
-            tb_writer.close()
-            print(f"TensorBoard logs saved to: {tb_log_dir}")
+        # if tb_writer:
+        #     tb_writer.close()
+        #     print(f"TensorBoard logs saved to: {tb_log_dir}")
         
         if args.use_wandb:
             wandb.finish()
