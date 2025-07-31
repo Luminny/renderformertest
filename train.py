@@ -399,6 +399,15 @@ def main():
     # Create output directory (only on rank 0)
     args.output_dir = os.path.join(args.output_dir, args.wandb_run_name)
     if rank == 0:
+        def check_write_permission(path):
+            while path != "/":
+                if os.access(path, os.W_OK):
+                    print(f"Output directory {path} is writable")
+                else:
+                    print(f"Output directory {path} is not writable")
+                path = os.path.dirname(path)
+
+        check_write_permission(args.output_dir)
         os.makedirs(args.output_dir, exist_ok=True)
     
     # Initialize TensorBoard if requested (only on rank 0)
