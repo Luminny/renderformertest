@@ -31,7 +31,7 @@ from renderformer.models.geo_raster import GeoRaster
 from renderformer.models.renderformer import RenderFormer
 
 from train_loss import compute_loss, loss_fn_alex
-from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state
+from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state, log_gradient_stats
 from train_datasets import RenderFormerDataset, tile_based_collate_fn
 
 
@@ -99,7 +99,7 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
             
             # Compute loss if ground truth is available
             if gt_images is not None:
-                loss = compute_loss(rendered_imgs, gt_images.to(torch.float16), 
+                loss = compute_loss(rendered_imgs, gt_images.to(torch_dtype), 
                                   config.loss_type)
                 
                 # Handle multi-GPU training - convert tensor loss to scalar
@@ -173,22 +173,14 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                 wandb.log({
                     'train_loss': loss.item(),
                     'learning_rate': scheduler.get_last_lr()[0],
-                    'batch': batch_idx,
-                    'global_step': global_step
                 })
                 
-                # Log gradient norms by module every 1000 steps
-                if global_step % 1000 == 1:
-                    gradient_stats = compute_gradient_stats_by_module(pipeline.model)
-                    for module_name, stats in gradient_stats.items():
-                        wandb.log({
-                            f'gradients/{module_name}/mean': stats['mean'],
-                            f'gradients/{module_name}/max': stats['max'],
-                            'global_step': global_step
-                        })
+                # Log gradient norms by module every log_gradient_freq steps
+                if global_step % config.log_gradient_freq == 1:
+                    log_gradient_stats(pipeline.model)
                 
-                # Log sample images every 50 steps
-                if global_step % 50 == 0 and gt_images is not None:
+                # Log sample images every log_image_freq steps
+                if global_step % config.log_image_freq == 0 and gt_images is not None:
                     # Take first image from batch for visualization
                     pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
                     gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
@@ -202,7 +194,7 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                     
                     wandb.log({
                         'images/prediction_ground_truth': wandb.Image(concat_img),
-                        'global_step': global_step
+                        # 'global_step': global_step
                     })
             
             # Update progress bar (only on rank 0)
@@ -329,7 +321,7 @@ def main():
                        help="Weight decay")
     parser.add_argument("--grad_clip", type=float, default=0, 
                        help="Gradient clipping value")
-    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'l1_w_l2', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex'], 
+    parser.add_argument("--loss_type", type=str, choices=['l1', 'l2', 'l1_w_l2', 'lpips_alex', 'lpips_vgg', 'l1_w_lpips_alex', 'l2_w_lpips_alex'], 
                        default='l1', help="Loss function type")
     parser.add_argument("--warmup_steps", type=int, default=8000, 
                        help="Number of warmup steps for learning rate")
@@ -349,16 +341,22 @@ def main():
     # Logging arguments
     parser.add_argument("--use_wandb", action="store_true", 
                        help="Use Weights & Biases for logging")
-    parser.add_argument("--wandb_project", type=str, default="renderformer", 
+    parser.add_argument("--wandb_entity", type=str, default="rendering-team", 
+                       help="W&B entity name")
+    parser.add_argument("--wandb_project", type=str, default="renderformer-raster", 
                        help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default="test_run", 
                        help="W&B run name")
     parser.add_argument("--wandb_dir", type=str, 
                        help="Directory to store wandb local files (default: ./wandb)")
-    parser.add_argument("--use_tensorboard", action="store_true", 
-                       help="Use TensorBoard for logging")
-    parser.add_argument("--log_dir", type=str, default="./logs", 
-                       help="Output directory for logs")
+    parser.add_argument("--log_gradient_freq", type=int, default=2000, 
+                       help="Frequency of logging gradient statistics to wandb")
+    parser.add_argument("--log_image_freq", type=int, default=100, 
+                       help="Frequency of logging images to wandb")
+    # parser.add_argument("--use_tensorboard", action="store_true", 
+    #                    help="Use TensorBoard for logging")
+    # parser.add_argument("--log_dir", type=str, default="./logs", 
+    #                    help="Output directory for logs")
     
     args = parser.parse_args()
 
@@ -395,6 +393,7 @@ def main():
         raise ValueError(f"Invalid pipeline type: {args.pipeline_type}")
     
     # Create output directory (only on rank 0)
+    args.output_dir = os.path.join(args.output_dir, args.wandb_run_name)
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok=True)
     
@@ -417,6 +416,7 @@ def main():
             print(f"Wandb local files will be saved to: {args.wandb_dir}")
         
         wandb.init(
+            entity=args.wandb_entity,
             project=args.wandb_project,
             name=args.wandb_run_name,
             config=vars(args),
@@ -668,18 +668,18 @@ def main():
         # Log epoch training loss to Wandb (only on rank 0)
         if args.use_wandb and rank == 0:
             wandb.log({
-                'epoch': epoch,
+                # 'epoch': epoch,
                 'train_loss_epoch': train_loss
             })
             
-            # Log gradient statistics at epoch end
-            gradient_stats = compute_gradient_stats_by_module(pipeline.model)
-            for module_name, stats in gradient_stats.items():
-                wandb.log({
-                    f'gradients_epoch/{module_name}/mean': stats['mean'],
-                    f'gradients_epoch/{module_name}/max': stats['max'],
-                    'epoch': epoch
-                })
+            # # Log gradient statistics at epoch end
+            # gradient_stats = compute_gradient_stats_by_module(pipeline.model)
+            # for module_name, stats in gradient_stats.items():
+            #     wandb.log({
+            #         f'gradients_epoch/{module_name}/mean': stats['mean'],
+            #         f'gradients_epoch/{module_name}/max': stats['max'],
+            #         # 'epoch': epoch
+            #     })
         
         # Validate
         val_loss = None
@@ -695,7 +695,7 @@ def main():
             # Log to wandb (only on rank 0)
             if args.use_wandb and rank == 0:
                 wandb.log({
-                    'epoch': epoch,
+                    # 'epoch': epoch,
                     'train_loss': train_loss,
                     'val_loss': val_loss
                 })
@@ -710,7 +710,7 @@ def main():
         else:
             if args.use_wandb and rank == 0:
                 wandb.log({
-                    'epoch': epoch,
+                    # 'epoch': epoch,
                     'train_loss': train_loss
                 })
         

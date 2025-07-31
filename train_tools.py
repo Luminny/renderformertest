@@ -1,5 +1,42 @@
 import os
 import torch
+import wandb
+import numpy as np
+
+# Define module groups based on the model structure
+module_groups = {
+    'embeddings': ['tri_token', 'reg_tokens'],
+    'vn_encoding': ['vn_encoding_proj', 'vn_encoder_norm'],
+    'transformer': ['transformer.layers'],
+    'view_transformer_core': ['view_transformer.transformer'],
+    'view_transformer_encoder': ['view_transformer.ray_map_patch_token', 'view_transformer.ray_map_encoder', 'view_transformer.ray_map_encoder_norm'],
+    'view_transformer_output': ['view_transformer.out_dpt'],
+    'rope_embeddings': ['rope_emb']
+}
+
+def log_gradient_stats(model):
+    # Handle DataParallel/DistributedDataParallel wrapper
+    if hasattr(model, 'module'):
+        model = model.module
+
+    for group_name, module_prefixes in module_groups.items():
+        grad_tensors = []
+        
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # Check if this parameter belongs to the current module group
+                for prefix in module_prefixes:
+                    if name.startswith(prefix):
+                        grad_tensors.append(param.grad.data.flatten())
+                        break
+        
+        if grad_tensors:
+            # Concatenate all gradient tensors for this module group
+            all_grads = torch.cat(grad_tensors, dim=0)
+            wandb.log({
+                f'gradients_histograms/{group_name}': wandb.Histogram(all_grads.cpu())
+            })
+    
 
 def compute_gradient_stats_by_module(model):
     """
@@ -14,17 +51,6 @@ def compute_gradient_stats_by_module(model):
     # Handle DataParallel/DistributedDataParallel wrapper
     if hasattr(model, 'module'):
         model = model.module
-    
-    # Define module groups based on the model structure
-    module_groups = {
-        'embeddings': ['tri_token', 'reg_tokens'],
-        'vn_encoding': ['vn_encoding_proj', 'vn_encoder_norm'],
-        'transformer': ['transformer.layers'],
-        'view_transformer_core': ['view_transformer.transformer'],
-        'view_transformer_encoder': ['view_transformer.ray_map_patch_token', 'view_transformer.ray_map_encoder', 'view_transformer.ray_map_encoder_norm'],
-        'view_transformer_output': ['view_transformer.out_dpt'],
-        'rope_embeddings': ['rope_emb']
-    }
     
     gradient_stats = {}
     

@@ -33,5 +33,7 @@ def compute_loss(pred_images, gt_images, loss_type='l1'):
     #     return loss_fn_vgg(convert_for_lpips(pred_images), convert_for_lpips(gt_images))
     elif loss_type == 'l1_w_lpips_alex':
         return F.l1_loss(pred_images, gt_images) + 0.05 * loss_fn_alex(convert_for_lpips(pred_images), convert_for_lpips(gt_images)).mean()
+    elif loss_type == 'l2_w_lpips_alex':
+        return 10 * F.mse_loss(pred_images, gt_images) + 0.05 * loss_fn_alex(convert_for_lpips(pred_images), convert_for_lpips(gt_images)).mean()
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
