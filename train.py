@@ -349,6 +349,10 @@ def main():
                        help="W&B run name")
     parser.add_argument("--wandb_dir", type=str, 
                        help="Directory to store wandb local files (default: ./wandb)")
+    parser.add_argument("--wandb_api_key", type=str, 
+                       help="W&B API key")
+    parser.add_argument("--wandb_host", type=str, 
+                       help="W&B host URL (e.g., http://10.49.8.98)")
     parser.add_argument("--log_gradient_freq", type=int, default=2000, 
                        help="Frequency of logging gradient statistics to wandb")
     parser.add_argument("--log_image_freq", type=int, default=100, 
@@ -414,6 +418,19 @@ def main():
         if args.wandb_dir:
             os.environ['WANDB_DIR'] = args.wandb_dir
             print(f"Wandb local files will be saved to: {args.wandb_dir}")
+
+        # Set wandb host if specified
+        if hasattr(args, 'wandb_host') and args.wandb_host:
+            os.environ['WANDB_BASE_URL'] = args.wandb_host
+            print(f"Wandb host set to: {args.wandb_host}")
+
+        # login wandb
+        if os.environ.get("WANDB_API_KEY"):
+            wandb.login()
+        elif hasattr(args, 'wandb_api_key') and args.wandb_api_key:
+            wandb.login(key=args.wandb_api_key)
+        else:
+            raise ValueError("WANDB_API_KEY is not set, please set it in the environment variable or in the arguments")
         
         wandb.init(
             entity=args.wandb_entity,
