@@ -78,6 +78,10 @@ class RenderFormerConfig:
     """The size of the tile in the tile-based rendering pipeline."""
     include_alpha: bool = False
     """Whether to include the alpha channel in the texture patch."""
+    output_channels: int = 3
+    """The number of output channels in the view transformer."""
+    output_channels_type: Literal['normal', 'normal_depth', 'normal_depth_diffuse', 'lighting'] = 'normal'
+    """The type of output channels in the view transformer."""
     use_dpt_decoder: bool = False
     """Whether to use DPT decoder for rendering."""
     dpt_features: int = 128

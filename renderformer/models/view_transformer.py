@@ -74,13 +74,13 @@ class ViewTransformer(nn.Module):
             use_swin_attn=self.config.view_transformer_use_swin_attn,
         )
         if not config.use_dpt_decoder:
-            self.out_proj = nn.Linear(self.config.view_transformer_latent_dim, self.config.patch_size * self.config.patch_size * (4 if config.include_alpha else 3))
+            self.out_proj = nn.Linear(self.config.view_transformer_latent_dim, self.config.patch_size * self.config.patch_size * self.config.output_channels)
         elif self.config.dpt_out_layers is not None and len(self.config.dpt_out_layers) == 2:
             self.out_dpt = DPTHead2(
                 in_channels=self.config.view_transformer_latent_dim,
                 features=self.config.dpt_features,
                 out_channels=self.config.dpt_out_channels,
-                out_dim=4 if config.include_alpha else 3
+                out_dim=self.config.output_channels
             )
             self.out_layers = list(self.config.dpt_out_layers)
         else:
@@ -88,7 +88,7 @@ class ViewTransformer(nn.Module):
                 in_channels=self.config.view_transformer_latent_dim,
                 features=self.config.dpt_features,
                 out_channels=self.config.dpt_out_channels,
-                out_dim=4 if config.include_alpha else 3
+                out_dim=self.config.output_channels
             )
             self.out_layers = list(range(self.config.view_transformer_n_layers - 4, self.config.view_transformer_n_layers)) if self.config.dpt_out_layers is None else self.config.dpt_out_layers
         self.out_proj_act = nn.ELU(alpha=1e-3)

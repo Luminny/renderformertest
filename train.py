@@ -31,7 +31,7 @@ from renderformer.models.geo_raster import GeoRaster
 from renderformer.models.renderformer import RenderFormer
 
 from train_loss import compute_loss, loss_fn_alex
-from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state, log_gradient_stats
+from train_tools import compute_gradient_stats_by_module, save_checkpoint, load_epoch_from_training_state, load_optimizer_state, log_gradient_stats, log_image_stats
 from train_datasets import RenderFormerDataset, tile_based_collate_fn
 
 
@@ -181,21 +181,22 @@ def train_epoch(pipeline, dataloader, optimizer, scheduler, device, config, scal
                 
                 # Log sample images every log_image_freq steps
                 if global_step % config.log_image_freq == 0 and gt_images is not None:
-                    # Take first image from batch for visualization
-                    pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
-                    gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
+                    log_image_stats(rendered_imgs, gt_images, pipeline.config.output_channels_type)
+                    # # Take first image from batch for visualization
+                    # pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, 3]
+                    # gt_img = torch.clamp(gt_images[0, 0], 0, 1).cpu()  # [H, W, 3]
                     
-                    # Convert to format for Wandb (CHW)
-                    pred_img = pred_img.permute(2, 0, 1)  # [3, H, W]
-                    gt_img = gt_img.permute(2, 0, 1)  # [3, H, W]
+                    # # Convert to format for Wandb (CHW)
+                    # pred_img = pred_img.permute(2, 0, 1)  # [3, H, W]
+                    # gt_img = gt_img.permute(2, 0, 1)  # [3, H, W]
 
-                    # concatenate pred_img and gt_img
-                    concat_img = torch.cat([pred_img, gt_img], dim=2)
+                    # # concatenate pred_img and gt_img
+                    # concat_img = torch.cat([pred_img, gt_img], dim=2)
                     
-                    wandb.log({
-                        'images/prediction_ground_truth': wandb.Image(concat_img),
-                        # 'global_step': global_step
-                    })
+                    # wandb.log({
+                    #     'images/prediction_ground_truth': wandb.Image(concat_img),
+                    #     # 'global_step': global_step
+                    # })
             
             # Update progress bar (only on rank 0)
             if rank == 0:
@@ -514,7 +515,7 @@ def main():
     # loss_fn_alex.to(device)
     
     # Create datasets and dataloaders
-    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris, args.pipeline_type, pipeline.config.tile_size)
+    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris, args.pipeline_type, pipeline.config)
     
     # Use DistributedSampler for distributed training
     if is_distributed:

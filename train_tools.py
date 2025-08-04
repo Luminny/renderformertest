@@ -14,6 +14,42 @@ module_groups = {
     'rope_embeddings': ['rope_emb']
 }
 
+def log_image_stats(rendered_imgs, gt_imgs, output_channels_type):
+    # Take first image from batch for visualization
+    pred_img = torch.clamp(rendered_imgs[0, 0], 0, 1).cpu()  # [H, W, C]
+    gt_img = torch.clamp(gt_imgs[0, 0], 0, 1).cpu()  # [H, W, C]
+    # Convert to format for Wandb (CHW)
+    pred_img = pred_img.permute(2, 0, 1)  # [C, H, W]
+    gt_img = gt_img.permute(2, 0, 1)  # [C, H, W]
+
+    if output_channels_type == 'normal':
+        # [pred_normal_img, gt_normal_img]
+        concat_img = torch.cat([pred_img, gt_img], dim=2)
+        
+    elif output_channels_type == 'normal_depth':
+        # [pred_normal_img, gt_normal_img]
+        # [pred_depth_img, gt_depth_img]
+        concat_normal_img = torch.cat([pred_img[:3], gt_img[:3]], dim=2)
+        concat_depth_img = torch.cat([pred_img[3:], gt_img[3:]], dim=2).repeat(3, 1, 1)
+        concat_img = torch.cat([concat_normal_img, concat_depth_img], dim=1)
+
+    elif output_channels_type == 'normal_depth_diffuse':
+        # [pred_normal_img, gt_normal_img]
+        # [pred_depth_img, gt_depth_img]
+        # [pred_diffuse_img, gt_diffuse_img]
+        concat_normal_img = torch.cat([pred_img[:3], gt_img[:3]], dim=2)
+        concat_depth_img = torch.cat([pred_img[3:4], gt_img[3:4]], dim=2).repeat(3, 1, 1)
+        concat_diffuse_img = torch.cat([pred_img[4:], gt_img[4:]], dim=2)
+        concat_img = torch.cat([concat_normal_img, concat_depth_img, concat_diffuse_img], dim=1)
+
+    elif output_channels_type == 'lighting':
+        # [pred_lighting_img, gt_lighting_img]
+        concat_img = torch.cat([pred_img, gt_img], dim=2)
+
+    wandb.log({
+        'images/prediction_ground_truth': wandb.Image(concat_img),
+    })
+
 def log_gradient_stats(model):
     # Handle DataParallel/DistributedDataParallel wrapper
     if hasattr(model, 'module'):

@@ -13,31 +13,40 @@ from renderformer.utils.ray_generator import RayGenerator
 from einops import rearrange
 
 class RenderFormerDataset(Dataset):
-    def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline", tile_size=32):
+    def __init__(self, data_dir, resolution=256, max_num_tris=2048, pipeline_type="GeoRasterRenderingPipeline", config=None):
         self.pipeline_type = pipeline_type
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.max_num_tris = max_num_tris
         self.h5_files = list(self.data_dir.glob("*/*.h5"))
 
-        self.tile_size = 0
+        self.tile_size = config.tile_size
         self.need_padding = False
-        self.exr_file_path = ''
+        self.exr_file_path = []
         self.need_texture = False
+        self.output_channels = config.output_channels
+        self.output_channels_type = config.output_channels_type
+
+        if config.output_channels_type == 'normal':
+            self.exr_file_path = ['_normal_depth.exr']
+        elif config.output_channels_type == 'normal_depth':
+            self.exr_file_path = ['_normal_depth.exr']
+        elif config.output_channels_type == 'normal_depth_diffuse':
+            self.exr_file_path = ['_normal_depth.exr', '_diffusecolor.exr']
+        elif config.output_channels_type == 'lighting':
+            self.exr_file_path = ['_lighting.exr']
+        else:
+            raise ValueError(f"Invalid output channels: {config.output_channels}")
 
         if self.pipeline_type == "TileBasedRenderingPipeline":
-            self.tile_size = tile_size
-            self.tile_resolution = resolution // tile_size
+            self.tile_resolution = resolution // self.tile_size
             self.tile_num = self.tile_resolution ** 2
             self.need_padding = False
-            self.exr_file_path = '_normal_depth.exr'
             self.need_texture = False
         elif self.pipeline_type == "GeoRasterRenderingPipeline":
-            self.exr_file_path = '_normal_depth.exr'
             self.need_texture = False
             self.need_padding = True
         elif self.pipeline_type == "RenderFormerRenderingPipeline":
-            self.exr_file_path = '_lighting.exr'
             self.need_texture = True
             self.need_padding = True
         else:
@@ -83,6 +92,37 @@ class RenderFormerDataset(Dataset):
         
         # This should never be reached, but just in case
         raise RuntimeError(f"Failed to load data after {max_retries} attempts")
+
+    def _load_gt_images(self, h5_file):
+        """
+        Load ground truth images from EXR file
+        """
+        gt_images_list = []
+        for exr_file_path in self.exr_file_path:
+            gt_images_exr_file = str(h5_file).replace('.h5', exr_file_path)
+            try:
+                gt_images = torch.from_numpy(
+                    imageio.v3.imread(gt_images_exr_file).astype(np.float32)
+                ).unsqueeze(0)
+                
+                # Check if the loaded image resolution matches self.resolution
+                # gt_images shape: [1, H, W, 3]
+                loaded_height, loaded_width = gt_images.shape[1], gt_images.shape[2]
+                
+                if loaded_height != self.resolution or loaded_width != self.resolution:
+                    # Resize the image to match self.resolution
+                    gt_images = torch.nn.functional.interpolate(
+                        gt_images.permute(0, 3, 1, 2),  # [1, 3, H, W]
+                        size=(self.resolution, self.resolution),
+                        mode='bilinear',
+                        align_corners=False
+                    ).permute(0, 2, 3, 1)  # [1, H, W, 3]
+                gt_images_list.append(gt_images)
+            except Exception as e:
+                raise Exception(f"Failed to read EXR file {gt_images_exr_file}: "
+                            f"{type(e).__name__}: {str(e)}")
+        gt_images = torch.cat(gt_images_list, dim=0)[..., :self.output_channels]
+        return gt_images
     
     def _load_single_file(self, idx):
         """
@@ -153,29 +193,7 @@ class RenderFormerDataset(Dataset):
                 # Exact size, no padding needed
                 mask = torch.ones(self.max_num_tris, dtype=torch.bool)
 
-        # Load ground truth images
-        gt_images_exr_file = str(h5_file).replace('.h5', self.exr_file_path)
-        try:
-            gt_images = torch.from_numpy(
-                imageio.v3.imread(gt_images_exr_file).astype(np.float32)[..., :3]
-            ).unsqueeze(0)
-            
-            # Check if the loaded image resolution matches self.resolution
-            # gt_images shape: [1, H, W, 3]
-            loaded_height, loaded_width = gt_images.shape[1], gt_images.shape[2]
-            
-            if loaded_height != self.resolution or loaded_width != self.resolution:
-                # Resize the image to match self.resolution
-                gt_images = torch.nn.functional.interpolate(
-                    gt_images.permute(0, 3, 1, 2),  # [1, 3, H, W]
-                    size=(self.resolution, self.resolution),
-                    mode='bilinear',
-                    align_corners=False
-                ).permute(0, 2, 3, 1)  # [1, H, W, 3]
-                
-        except Exception as e:
-            raise Exception(f"Failed to read EXR file {gt_images_exr_file}: "
-                          f"{type(e).__name__}: {str(e)}")
+        gt_images = self._load_gt_images(h5_file)
 
         if self.pipeline_type == "GeoRasterRenderingPipeline":
             data = {
