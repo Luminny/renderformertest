@@ -514,7 +514,7 @@ def main():
     # loss_fn_alex.to(device)
     
     # Create datasets and dataloaders
-    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris, args.pipeline_type)
+    train_dataset = RenderFormerDataset(args.train_data_dir, args.resolution, args.max_num_tris, args.pipeline_type, pipeline.config.tile_size)
     
     # Use DistributedSampler for distributed training
     if is_distributed:
